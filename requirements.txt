@@ -1,0 +1,15 @@
+# Local requirements for running Text-DIRE experiments
+# Modal handles GPU-side dependencies automatically
+
+# Required: Modal CLI for cloud GPU execution
+modal>=0.60.0
+
+# Optional: For local testing without GPU
+# torch>=2.0
+# transformers>=4.38
+# datasets
+# scikit-learn
+# matplotlib
+# seaborn
+# numpy
+# tqdm
