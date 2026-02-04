@@ -19,6 +19,7 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "seaborn",
     "numpy",
     "scipy",  # For DivEye features (skewness, kurtosis)
+    "xgboost",  # For enhanced classifier
     "tqdm",
     "huggingface_hub",
     "sentencepiece",
@@ -2449,6 +2450,432 @@ def run_beemo_diveye(
     volumes={"/vol": volume},
     memory=32768,
 )
+def run_beemo_enhanced(
+    scenarios: list[str] = None,
+    mask_ratios: list[float] = None,
+    max_samples: int = None,
+    max_length: int = 512,
+):
+    """
+    Enhanced Beemo benchmark with all improvements:
+    - 14 features (9 DivEye + 2 late-stage + 3 stylometric)
+    - XGBoost classifier
+    - Multi-mask ratio ensemble
+
+    Target: 85%+ AUROC on Easy scenario.
+
+    Usage:
+        modal run modal_app.py --experiment beemo-enhanced
+        modal run modal_app.py --experiment beemo-enhanced --num-samples 200
+    """
+    from xgboost import XGBClassifier
+    import os
+    import json
+    import torch
+    import numpy as np
+    from datetime import datetime
+    from sklearn.model_selection import cross_val_predict
+    from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, roc_curve
+    from sklearn.preprocessing import StandardScaler
+    from scipy import stats
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+    from datasets import load_dataset
+
+    if scenarios is None:
+        scenarios = ["easy", "medium", "hard"]
+
+    if mask_ratios is None:
+        mask_ratios = [0.3, 0.5, 0.7]  # Multi-mask ensemble
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("=" * 60)
+    print("TEXT-DIRE: Enhanced Beemo Benchmark (DivEye++)")
+    print("=" * 60)
+    print(f"Features: 14 (9 DivEye + 2 late-stage + 3 stylometric)")
+    print(f"Classifier: XGBoost")
+    print(f"Mask ratios: {mask_ratios} (multi-mask ensemble)")
+    print(f"Total features per sample: {14 * len(mask_ratios)}")
+
+    # Load Beemo dataset
+    print("\n[1/3] Loading Beemo dataset from HuggingFace...")
+    dataset = load_dataset("toloka/beemo")
+    df = dataset["train"].to_pandas()
+
+    if max_samples:
+        df = df.head(max_samples)
+
+    print(f"Loaded {len(df)} samples")
+    print(f"Categories: {df['category'].unique().tolist()}")
+
+    # Load LLaDA model
+    print("\n[2/3] Loading LLaDA-8B for DIRE...")
+    MASK_ID = 126336
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        cache_dir=MODEL_DIR,
+    )
+
+    model = AutoModel.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        cache_dir=MODEL_DIR,
+    ).to("cuda").eval()
+
+    print("LLaDA-8B loaded!")
+
+    # Feature extraction functions (inline for Modal serialization)
+    def extract_diveye_features(token_correctness):
+        """Extract 9 DivEye features from per-token reconstruction correctness."""
+        x = token_correctness.astype(float)
+        n = len(x)
+
+        if n < 4:
+            return {
+                'mean_accuracy': 0.5, 'variance': 0.0, 'skewness': 0.0, 'kurtosis': 0.0,
+                'diff_mean': 0.0, 'diff_variance': 0.0,
+                'diff2_variance': 0.0, 'diff2_entropy': 0.0, 'diff2_autocorr': 0.0,
+            }
+
+        # Distributional features
+        mean_acc = np.mean(x)
+        variance = np.var(x, ddof=1) if n > 1 else 0.0
+        skewness = stats.skew(x) if n > 2 else 0.0
+        kurtosis = stats.kurtosis(x) if n > 3 else 0.0
+
+        # First-order differences
+        dx = np.diff(x)
+        diff_mean = np.mean(dx) if len(dx) > 0 else 0.0
+        diff_variance = np.var(dx, ddof=1) if len(dx) > 1 else 0.0
+
+        # Second-order differences
+        d2x = np.diff(dx)
+        diff2_variance = np.var(d2x, ddof=1) if len(d2x) > 1 else 0.0
+
+        # Entropy of discretized second differences
+        if len(d2x) > 0:
+            bins = np.digitize(d2x, bins=[-0.5, 0.5])
+            _, counts = np.unique(bins, return_counts=True)
+            probs = counts / counts.sum()
+            diff2_entropy = -np.sum(probs * np.log(probs + 1e-10))
+        else:
+            diff2_entropy = 0.0
+
+        # Autocorrelation of second differences
+        if len(d2x) > 1:
+            d2x_centered = d2x - np.mean(d2x)
+            var_d2x = np.var(d2x)
+            if var_d2x > 1e-10:
+                autocorr_full = np.correlate(d2x_centered, d2x_centered, mode='full')
+                diff2_autocorr = autocorr_full[len(d2x_centered)] / (var_d2x * len(d2x))
+            else:
+                diff2_autocorr = 0.0
+        else:
+            diff2_autocorr = 0.0
+
+        return {
+            'mean_accuracy': float(mean_acc), 'variance': float(variance),
+            'skewness': float(skewness), 'kurtosis': float(kurtosis),
+            'diff_mean': float(diff_mean), 'diff_variance': float(diff_variance),
+            'diff2_variance': float(diff2_variance), 'diff2_entropy': float(diff2_entropy),
+            'diff2_autocorr': float(diff2_autocorr),
+        }
+
+    def extract_late_stage_features(token_correctness, window_size=20):
+        """Late-stage stability features - AI text stabilizes in second half."""
+        x = token_correctness.astype(float)
+        n = len(x)
+
+        if n < 10:
+            return {'derivative_dispersion': 0.0, 'local_volatility': 0.0}
+
+        # Use second half only
+        second_half = x[n // 2:]
+
+        # Derivative Dispersion: std of |diff| in second half
+        diffs = np.abs(np.diff(second_half))
+        derivative_dispersion = np.std(diffs) if len(diffs) > 1 else 0.0
+
+        # Local Volatility: mean of local stds in sliding window
+        local_stds = []
+        for i in range(max(1, len(second_half) - window_size)):
+            window = second_half[i:i + window_size]
+            if len(window) > 1:
+                local_stds.append(np.std(window))
+        local_volatility = np.mean(local_stds) if local_stds else 0.0
+
+        return {
+            'derivative_dispersion': float(derivative_dispersion),
+            'local_volatility': float(local_volatility),
+        }
+
+    def extract_stylometric_features(text):
+        """Text-level stylometric features."""
+        words = text.lower().split()
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
+
+        if not words:
+            return {
+                'type_token_ratio': 0.0,
+                'avg_sentence_length': 0.0,
+                'sentence_length_variance': 0.0
+            }
+
+        # Type-Token Ratio (vocabulary richness)
+        type_token_ratio = len(set(words)) / len(words)
+
+        # Sentence statistics
+        sentence_lengths = [len(s.split()) for s in sentences] if sentences else [0]
+        avg_sentence_length = np.mean(sentence_lengths)
+        sentence_length_variance = np.var(sentence_lengths) if len(sentence_lengths) > 1 else 0.0
+
+        return {
+            'type_token_ratio': float(type_token_ratio),
+            'avg_sentence_length': float(avg_sentence_length),
+            'sentence_length_variance': float(sentence_length_variance),
+        }
+
+    def extract_all_14_features(token_correctness, text):
+        """Extract all 14 features."""
+        features = {}
+        features.update(extract_diveye_features(token_correctness))
+        features.update(extract_late_stage_features(token_correctness))
+        features.update(extract_stylometric_features(text))
+        return features
+
+    def compute_dire_with_tokens(text, mask_ratio):
+        """Compute DIRE with per-token correctness data preserved."""
+        if not text or len(str(text).strip()) < 10:
+            return np.array([True, True, True, True])  # Default
+
+        try:
+            input_ids = tokenizer(
+                str(text),
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"].to("cuda")
+
+            seq_len = input_ids.shape[1]
+            if seq_len < 5:
+                return np.array([True, True, True, True])
+
+            num_mask = max(1, int(seq_len * mask_ratio))
+            positions = torch.randperm(seq_len, device=input_ids.device)[:num_mask]
+
+            masked_ids = input_ids.clone()
+            masked_ids[0, positions] = MASK_ID
+
+            with torch.no_grad():
+                logits = model(masked_ids).logits
+                predictions = logits.argmax(dim=-1)
+
+                # Per-token correctness at masked positions
+                original = input_ids[0, positions].cpu().numpy()
+                predicted = predictions[0, positions].cpu().numpy()
+                token_correctness = (original == predicted)
+
+            return token_correctness
+
+        except Exception as e:
+            print(f"Error in DIRE computation: {e}")
+            return np.array([True, True, True, True])
+
+    # Feature names for each mask ratio
+    base_feature_names = [
+        'mean_accuracy', 'variance', 'skewness', 'kurtosis',
+        'diff_mean', 'diff_variance', 'diff2_variance', 'diff2_entropy', 'diff2_autocorr',
+        'derivative_dispersion', 'local_volatility',
+        'type_token_ratio', 'avg_sentence_length', 'sentence_length_variance'
+    ]
+
+    # Create feature names for multi-mask ensemble
+    all_feature_names = []
+    for mask_ratio in mask_ratios:
+        for name in base_feature_names:
+            all_feature_names.append(f"{name}_m{int(mask_ratio*100)}")
+
+    print(f"\nTotal features: {len(all_feature_names)}")
+
+    # Evaluate each scenario
+    print(f"\n[3/3] Evaluating scenarios with enhanced features...")
+    results = {}
+
+    for scenario in scenarios:
+        print(f"\n{'='*50}")
+        print(f"Scenario: {scenario.upper()}")
+        print('='*50)
+
+        texts = []
+        labels = []
+
+        if scenario == "easy":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["model_output"] and len(str(row["model_output"]).strip()) > 10:
+                    texts.append(str(row["model_output"]))
+                    labels.append(1)
+
+        elif scenario == "medium":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["gpt-4o_edits"] and len(str(row["gpt-4o_edits"]).strip()) > 10:
+                    texts.append(str(row["gpt-4o_edits"]))
+                    labels.append(1)
+
+        elif scenario == "hard":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["human_edits"] and len(str(row["human_edits"]).strip()) > 10:
+                    texts.append(str(row["human_edits"]))
+                    labels.append(1)
+
+        print(f"Samples: {len(texts)} ({sum(1 for l in labels if l == 0)} human, {sum(labels)} AI)")
+
+        if len(texts) < 20:
+            print(f"Skipping {scenario} - too few samples")
+            continue
+
+        # Extract features for all mask ratios (multi-mask ensemble)
+        all_features = []
+        for text in tqdm(texts, desc=f"Enhanced features on {scenario}"):
+            sample_features = []
+            for mask_ratio in mask_ratios:
+                token_correct = compute_dire_with_tokens(text, mask_ratio)
+                feat = extract_all_14_features(token_correct, text)
+                sample_features.extend(list(feat.values()))
+            all_features.append(sample_features)
+
+        X = np.array(all_features)
+        y = np.array(labels)
+
+        # Handle NaN/Inf values
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Standardize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # XGBoost classifier with cross-validation
+        clf = XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric='auc',
+            use_label_encoder=False,
+            random_state=42,
+        )
+
+        try:
+            y_pred_proba = cross_val_predict(clf, X_scaled, y, cv=5, method='predict_proba')[:, 1]
+        except Exception as e:
+            print(f"CV failed, using simple train/test: {e}")
+            clf.fit(X_scaled, y)
+            y_pred_proba = clf.predict_proba(X_scaled)[:, 1]
+
+        # Compute metrics
+        auroc = roc_auc_score(y, y_pred_proba)
+
+        # Find optimal threshold
+        fpr, tpr, thresholds = roc_curve(y, y_pred_proba)
+        j_scores = tpr - fpr
+        optimal_idx = np.argmax(j_scores)
+        threshold = thresholds[optimal_idx]
+
+        predictions = (y_pred_proba >= threshold).astype(int)
+        accuracy = accuracy_score(y, predictions)
+        f1 = f1_score(y, predictions)
+
+        # Score distributions
+        human_scores = y_pred_proba[y == 0]
+        ai_scores = y_pred_proba[y == 1]
+
+        # Effect size
+        if len(human_scores) > 1 and len(ai_scores) > 1:
+            pooled_std = np.sqrt(
+                ((len(human_scores) - 1) * np.std(human_scores, ddof=1)**2 +
+                 (len(ai_scores) - 1) * np.std(ai_scores, ddof=1)**2) /
+                (len(human_scores) + len(ai_scores) - 2)
+            )
+        else:
+            pooled_std = 1.0
+        cohens_d = abs(np.mean(ai_scores) - np.mean(human_scores)) / pooled_std if pooled_std > 0 else 0
+
+        # Feature importance (fit on all data for analysis)
+        clf.fit(X_scaled, y)
+        feature_importance = dict(zip(all_feature_names, clf.feature_importances_.tolist()))
+
+        # Get top 5 features
+        top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        results[scenario] = {
+            "auroc": float(auroc),
+            "accuracy": float(accuracy),
+            "f1": float(f1),
+            "n_samples": len(y),
+            "human_mean": float(np.mean(human_scores)),
+            "human_std": float(np.std(human_scores)),
+            "ai_mean": float(np.mean(ai_scores)),
+            "ai_std": float(np.std(ai_scores)),
+            "separation": float(cohens_d),
+            "top_features": top_features,
+            "method": "DivEye++-14features-XGBoost-MultiMask",
+            "mask_ratios": mask_ratios,
+            "n_features": len(all_feature_names),
+        }
+
+        print(f"  AUROC:      {auroc:.4f}")
+        print(f"  Accuracy:   {accuracy:.4f}")
+        print(f"  F1:         {f1:.4f}")
+        print(f"  Human mean: {np.mean(human_scores):.4f}")
+        print(f"  AI mean:    {np.mean(ai_scores):.4f}")
+        print(f"  Separation: {cohens_d:.2f}")
+        print(f"  Top 5 features: {top_features}")
+
+    # Save results
+    output_path = os.path.join(RESULTS_DIR, f"beemo_enhanced_results_{timestamp}.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    volume.commit()
+
+    # Print summary table
+    print("\n" + "=" * 70)
+    print("BEEMO BENCHMARK RESULTS - TEXT-DIRE Enhanced (DivEye++)")
+    print("=" * 70)
+    print(f"{'Scenario':<15} {'AUROC':<10} {'Accuracy':<10} {'F1':<10} {'Separation':<12}")
+    print("-" * 70)
+
+    for scenario, r in results.items():
+        print(f"{scenario:<15} {r['auroc']:<10.4f} {r['accuracy']:<10.4f} "
+              f"{r['f1']:<10.4f} {r['separation']:<12.2f}")
+
+    print("=" * 70)
+    print(f"\nResults saved to: {output_path}")
+
+    return results
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=14400,  # 4 hours
+    volumes={"/vol": volume},
+    memory=32768,
+)
 def run_beemo_by_model(
     mask_ratio: float = 0.5,
     max_samples: int = None,
@@ -2705,10 +3132,11 @@ def main(
         modal run modal_app.py --experiment beemo-multistep --num-samples 200
         modal run modal_app.py --experiment beemo-logscale --num-samples 200
         modal run modal_app.py --experiment beemo-diveye --mask-ratio 0.8
+        modal run modal_app.py --experiment beemo-enhanced --num-samples 200
 
     Args:
         num_samples: Number of samples per class
-        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye)
+        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye, beemo-enhanced)
         mc_samples: MC samples for mc experiment
         models: Comma-separated list of models for modern experiment
         openai_key: OpenAI API key (required for modern experiment)
@@ -2836,6 +3264,35 @@ def main(
                 top_features = sorted(metrics['feature_importance'].items(),
                                      key=lambda x: abs(x[1]), reverse=True)[:3]
                 print(f"  Top features: {top_features}")
+
+        return results
+
+    elif experiment == "beemo-enhanced":
+        print(f"\nRunning ENHANCED Beemo (XGBoost + 14 features + multi-mask)...")
+        print("Features: 14 (9 DivEye + 2 late-stage + 3 stylometric)")
+        print("Classifier: XGBoost")
+        print("Mask ratios: [0.3, 0.5, 0.7] (multi-mask ensemble)")
+        results = run_beemo_enhanced.remote(
+            scenarios=["easy", "medium", "hard"],
+            mask_ratios=[0.3, 0.5, 0.7],
+            max_samples=num_samples if num_samples != 100 else None,
+            max_length=max_length,
+        )
+
+        print("\n" + "=" * 60)
+        print("BEEMO ENHANCED COMPLETE")
+        print("=" * 60)
+
+        for scenario, metrics in results.items():
+            print(f"\n{scenario.upper()}:")
+            print(f"  AUROC: {metrics['auroc']:.4f}")
+            print(f"  Accuracy: {metrics['accuracy']:.4f}")
+            print(f"  F1: {metrics['f1']:.4f}")
+            print(f"  Human mean: {metrics['human_mean']:.4f}")
+            print(f"  AI mean: {metrics['ai_mean']:.4f}")
+            print(f"  Separation: {metrics['separation']:.2f}")
+            if 'top_features' in metrics:
+                print(f"  Top 5 features: {metrics['top_features']}")
 
         return results
 

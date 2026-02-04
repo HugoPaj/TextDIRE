@@ -123,3 +123,115 @@ def get_feature_names() -> list:
         'diff_mean', 'diff_variance',
         'diff2_variance', 'diff2_entropy', 'diff2_autocorr'
     ]
+
+
+def extract_late_stage_features(token_correctness: np.ndarray, window_size: int = 20) -> dict:
+    """
+    Late-stage stability features - AI text stabilizes in second half.
+    Based on TSD paper (arxiv.org/abs/2601.04833).
+
+    Args:
+        token_correctness: Boolean array of shape (n_tokens,) where True = correct
+        window_size: Window size for local volatility calculation
+
+    Returns:
+        Dictionary with 2 features:
+        - derivative_dispersion: Std of |diff| in second half
+        - local_volatility: Mean of local stds in sliding window
+    """
+    x = token_correctness.astype(float)
+    n = len(x)
+
+    if n < 10:
+        return {'derivative_dispersion': 0.0, 'local_volatility': 0.0}
+
+    # Use second half only
+    second_half = x[n // 2:]
+
+    # Derivative Dispersion: std of |diff| in second half
+    diffs = np.abs(np.diff(second_half))
+    derivative_dispersion = np.std(diffs) if len(diffs) > 1 else 0.0
+
+    # Local Volatility: mean of local stds in sliding window
+    local_stds = []
+    for i in range(max(1, len(second_half) - window_size)):
+        window = second_half[i:i + window_size]
+        if len(window) > 1:
+            local_stds.append(np.std(window))
+    local_volatility = np.mean(local_stds) if local_stds else 0.0
+
+    return {
+        'derivative_dispersion': float(derivative_dispersion),
+        'local_volatility': float(local_volatility),
+    }
+
+
+def extract_stylometric_features(text: str) -> dict:
+    """
+    Text-level stylometric features.
+    Based on Ghostbuster and LOG-AID papers.
+
+    Args:
+        text: The raw text string
+
+    Returns:
+        Dictionary with 3 features:
+        - type_token_ratio: Vocabulary richness (unique words / total words)
+        - avg_sentence_length: Average number of words per sentence
+        - sentence_length_variance: Variance in sentence lengths
+    """
+    words = text.lower().split()
+    sentences = [s.strip() for s in text.split('.') if s.strip()]
+
+    if not words:
+        return {
+            'type_token_ratio': 0.0,
+            'avg_sentence_length': 0.0,
+            'sentence_length_variance': 0.0
+        }
+
+    # Type-Token Ratio (vocabulary richness)
+    type_token_ratio = len(set(words)) / len(words)
+
+    # Sentence statistics
+    sentence_lengths = [len(s.split()) for s in sentences] if sentences else [0]
+    avg_sentence_length = np.mean(sentence_lengths)
+    sentence_length_variance = np.var(sentence_lengths) if len(sentence_lengths) > 1 else 0.0
+
+    return {
+        'type_token_ratio': float(type_token_ratio),
+        'avg_sentence_length': float(avg_sentence_length),
+        'sentence_length_variance': float(sentence_length_variance),
+    }
+
+
+def extract_all_features(token_correctness: np.ndarray, text: str) -> dict:
+    """
+    Extract all 14 features (9 DivEye + 2 late-stage + 3 stylometric).
+
+    Args:
+        token_correctness: Boolean array of shape (n_tokens,) where True = correct
+        text: The raw text string
+
+    Returns:
+        Dictionary with 14 features
+    """
+    features = {}
+    features.update(extract_diveye_features(token_correctness))
+    features.update(extract_late_stage_features(token_correctness))
+    features.update(extract_stylometric_features(text))
+    return features
+
+
+def get_all_feature_names() -> list:
+    """Return ordered list of all 14 feature names."""
+    return [
+        # DivEye features (9)
+        'mean_accuracy', 'variance', 'skewness', 'kurtosis',
+        'diff_mean', 'diff_variance',
+        'diff2_variance', 'diff2_entropy', 'diff2_autocorr',
+        # Late-stage features (2)
+        'derivative_dispersion', 'local_volatility',
+        # Stylometric features (3)
+        'type_token_ratio', 'avg_sentence_length', 'sentence_length_variance',
+    ]
