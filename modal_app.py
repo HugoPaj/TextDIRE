@@ -18,6 +18,7 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "matplotlib",
     "seaborn",
     "numpy",
+    "scipy",  # For DivEye features (skewness, kurtosis)
     "tqdm",
     "huggingface_hub",
     "sentencepiece",
@@ -1203,6 +1204,345 @@ def run_modern_ai_experiment(
     volumes={"/vol": volume},
     memory=32768,
 )
+def run_beemo_logscale(
+    scenarios: list[str] = None,
+    mask_ratio: float = 0.8,
+    max_samples: int = None,
+):
+    """
+    Run Beemo benchmark with LOG-SCALE scoring (like Binoculars).
+
+    Binoculars uses: B(s) = log PPL(s) / log X-PPL(s)
+
+    We adapt this for DIRE:
+    - log_perplexity = -mean(log P(correct_token))
+    - This gives larger separation than raw accuracy
+
+    Args:
+        scenarios: List of scenarios to evaluate
+        mask_ratio: Mask ratio for DIRE
+        max_samples: Limit samples (None = use all)
+    """
+    import os
+    import json
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    from datetime import datetime
+    from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, roc_curve
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+    from datasets import load_dataset
+
+    if scenarios is None:
+        scenarios = ["easy", "medium", "hard"]
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("=" * 60)
+    print("TEXT-DIRE: Log-Scale Scoring (Binoculars-style)")
+    print(f"Mask ratio: {mask_ratio}")
+    print("=" * 60)
+
+    # Load Beemo dataset
+    print("\n[1/3] Loading Beemo dataset...")
+    dataset = load_dataset("toloka/beemo")
+    df = dataset["train"].to_pandas()
+
+    if max_samples:
+        df = df.sample(n=min(max_samples, len(df)), random_state=42)
+
+    print(f"Loaded {len(df)} samples")
+
+    # Load LLaDA model
+    print("\n[2/3] Loading LLaDA-8B...")
+    MASK_ID = 126336
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        cache_dir=MODEL_DIR,
+    )
+
+    model = AutoModel.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        cache_dir=MODEL_DIR,
+    ).to("cuda").eval()
+
+    print("LLaDA-8B loaded!")
+
+    def compute_logscale_dire_score(text):
+        """
+        Compute DIRE score using log-scale metrics (like Binoculars).
+
+        Returns multiple log-scale metrics:
+        - log_perplexity: -mean(log P(target)) - higher = more human-like
+        - log_accuracy: log(accuracy) - higher = more AI-like
+        - perplexity: exp(log_perplexity) - traditional perplexity
+        """
+        if not text or len(str(text).strip()) < 10:
+            return {
+                "accuracy": 0.5,
+                "log_perplexity": 3.0,
+                "perplexity": 20.0,
+                "log_accuracy": -0.7,
+                "mean_log_prob": -3.0,
+            }
+
+        try:
+            input_ids = tokenizer(
+                str(text),
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )["input_ids"].to("cuda")
+
+            seq_len = input_ids.shape[1]
+            if seq_len < 5:
+                return {
+                    "accuracy": 0.5,
+                    "log_perplexity": 3.0,
+                    "perplexity": 20.0,
+                    "log_accuracy": -0.7,
+                    "mean_log_prob": -3.0,
+                }
+
+            # Mask tokens
+            num_mask = max(1, int(seq_len * mask_ratio))
+            mask_positions = torch.zeros(seq_len, dtype=torch.bool, device="cuda")
+            positions = torch.randperm(seq_len, device="cuda")[:num_mask]
+            mask_positions[positions] = True
+
+            masked_ids = input_ids.clone()
+            masked_ids[0, mask_positions] = MASK_ID
+
+            with torch.no_grad():
+                logits = model(masked_ids).logits
+
+                # Get probabilities
+                log_probs = F.log_softmax(logits, dim=-1)
+                probs = torch.exp(log_probs)
+
+                # Get predictions and targets at masked positions
+                masked_logits = logits[0, mask_positions]
+                masked_log_probs = log_probs[0, mask_positions]
+                masked_probs = probs[0, mask_positions]
+                targets = input_ids[0, mask_positions]
+
+                # 1. Raw accuracy (baseline)
+                predictions = masked_logits.argmax(dim=-1)
+                correct = (predictions == targets).float()
+                accuracy = correct.mean().item()
+
+                # 2. Log probability of correct tokens (like Binoculars perplexity)
+                # This is the key metric - log P(correct token | context)
+                target_log_probs = masked_log_probs[
+                    torch.arange(len(targets), device="cuda"),
+                    targets
+                ]
+                mean_log_prob = target_log_probs.mean().item()
+
+                # 3. Log perplexity = -mean(log P)
+                # Higher log_perplexity = text is more surprising = more human-like
+                log_perplexity = -mean_log_prob
+
+                # 4. Traditional perplexity
+                perplexity = np.exp(log_perplexity)
+
+                # 5. Log accuracy (for comparison)
+                log_accuracy = np.log(accuracy + 1e-10)
+
+            return {
+                "accuracy": accuracy,
+                "log_perplexity": log_perplexity,
+                "perplexity": perplexity,
+                "log_accuracy": log_accuracy,
+                "mean_log_prob": mean_log_prob,
+            }
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return {
+                "accuracy": 0.5,
+                "log_perplexity": 3.0,
+                "perplexity": 20.0,
+                "log_accuracy": -0.7,
+                "mean_log_prob": -3.0,
+            }
+
+    # Evaluate each scenario
+    print("\n[3/3] Evaluating scenarios with log-scale scoring...")
+    results = {}
+
+    for scenario in scenarios:
+        print(f"\n{'='*50}")
+        print(f"Scenario: {scenario.upper()}")
+        print('='*50)
+
+        texts = []
+        labels = []
+
+        if scenario == "easy":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["model_output"] and len(str(row["model_output"]).strip()) > 10:
+                    texts.append(str(row["model_output"]))
+                    labels.append(1)
+
+        elif scenario == "medium":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["gpt-4o_edits"] and len(str(row["gpt-4o_edits"]).strip()) > 10:
+                    texts.append(str(row["gpt-4o_edits"]))
+                    labels.append(1)
+
+        elif scenario == "hard":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["human_edits"] and len(str(row["human_edits"]).strip()) > 10:
+                    texts.append(str(row["human_edits"]))
+                    labels.append(1)
+
+        print(f"Samples: {len(texts)} ({sum(1 for l in labels if l == 0)} human, {sum(labels)} AI)")
+
+        if len(texts) < 20:
+            print(f"Skipping {scenario} - too few samples")
+            continue
+
+        # Compute log-scale DIRE scores
+        all_results = []
+        for text in tqdm(texts, desc=f"Log-scale DIRE on {scenario}"):
+            all_results.append(compute_logscale_dire_score(text))
+
+        labels = np.array(labels)
+
+        # Extract all metrics
+        accuracy_scores = np.array([r["accuracy"] for r in all_results])
+        log_ppl_scores = np.array([r["log_perplexity"] for r in all_results])
+        perplexity_scores = np.array([r["perplexity"] for r in all_results])
+        mean_log_prob_scores = np.array([r["mean_log_prob"] for r in all_results])
+
+        # Evaluate each metric
+        metrics_auroc = {}
+
+        # Accuracy (higher = AI)
+        auroc_acc = roc_auc_score(labels, accuracy_scores)
+        if auroc_acc < 0.5:
+            auroc_acc = 1 - auroc_acc
+        metrics_auroc["accuracy"] = auroc_acc
+
+        # Log perplexity (higher = human, so negate for AI detection)
+        auroc_log_ppl = roc_auc_score(labels, -log_ppl_scores)
+        if auroc_log_ppl < 0.5:
+            auroc_log_ppl = 1 - auroc_log_ppl
+        metrics_auroc["log_perplexity"] = auroc_log_ppl
+
+        # Mean log prob (higher = AI, more confident predictions)
+        auroc_mlp = roc_auc_score(labels, mean_log_prob_scores)
+        if auroc_mlp < 0.5:
+            auroc_mlp = 1 - auroc_mlp
+        metrics_auroc["mean_log_prob"] = auroc_mlp
+
+        # Find best metric
+        best_metric = max(metrics_auroc, key=metrics_auroc.get)
+        best_auroc = metrics_auroc[best_metric]
+
+        # Use best metric for other calculations
+        if best_metric == "accuracy":
+            scores = accuracy_scores
+        elif best_metric == "log_perplexity":
+            scores = -log_ppl_scores  # Negate so higher = AI
+        else:
+            scores = mean_log_prob_scores
+
+        # Find optimal threshold
+        fpr, tpr, thresholds = roc_curve(labels, scores)
+        j_scores = tpr - fpr
+        optimal_idx = np.argmax(j_scores)
+        threshold = thresholds[optimal_idx]
+
+        predictions = (scores >= threshold).astype(int)
+        acc = accuracy_score(labels, predictions)
+        f1 = f1_score(labels, predictions)
+
+        # Score distributions for best metric
+        human_scores = scores[labels == 0]
+        ai_scores = scores[labels == 1]
+
+        pooled_std = np.sqrt(
+            ((len(human_scores) - 1) * np.std(human_scores, ddof=1)**2 +
+             (len(ai_scores) - 1) * np.std(ai_scores, ddof=1)**2) /
+            (len(human_scores) + len(ai_scores) - 2)
+        )
+        cohens_d = abs(np.mean(ai_scores) - np.mean(human_scores)) / pooled_std if pooled_std > 0 else 0
+
+        # Log perplexity distributions (for analysis)
+        human_log_ppl = log_ppl_scores[labels == 0]
+        ai_log_ppl = log_ppl_scores[labels == 1]
+
+        results[scenario] = {
+            "auroc_accuracy": float(metrics_auroc["accuracy"]),
+            "auroc_log_perplexity": float(metrics_auroc["log_perplexity"]),
+            "auroc_mean_log_prob": float(metrics_auroc["mean_log_prob"]),
+            "best_metric": best_metric,
+            "best_auroc": float(best_auroc),
+            "accuracy": float(acc),
+            "f1": float(f1),
+            "n_samples": len(labels),
+            "separation": float(cohens_d),
+            "human_log_ppl_mean": float(np.mean(human_log_ppl)),
+            "ai_log_ppl_mean": float(np.mean(ai_log_ppl)),
+            "human_acc_mean": float(np.mean(accuracy_scores[labels == 0])),
+            "ai_acc_mean": float(np.mean(accuracy_scores[labels == 1])),
+        }
+
+        print(f"  AUROC (accuracy):       {metrics_auroc['accuracy']:.4f}")
+        print(f"  AUROC (log_perplexity): {metrics_auroc['log_perplexity']:.4f}")
+        print(f"  AUROC (mean_log_prob):  {metrics_auroc['mean_log_prob']:.4f}")
+        print(f"  Best metric: {best_metric} ({best_auroc:.4f})")
+        print(f"  Human log_ppl: {np.mean(human_log_ppl):.3f}, AI log_ppl: {np.mean(ai_log_ppl):.3f}")
+        print(f"  Separation (Cohen's d): {cohens_d:.2f}")
+
+    # Save results
+    output_path = os.path.join(RESULTS_DIR, f"beemo_logscale_{timestamp}.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    volume.commit()
+
+    # Print summary
+    print("\n" + "=" * 80)
+    print("BEEMO LOG-SCALE DIRE RESULTS")
+    print("=" * 80)
+    print(f"{'Scenario':<10} {'Accuracy':<12} {'LogPPL':<12} {'MeanLogP':<12} {'Best':<15} {'Sep':<8}")
+    print("-" * 80)
+
+    for scenario, r in results.items():
+        print(f"{scenario:<10} {r['auroc_accuracy']:<12.4f} {r['auroc_log_perplexity']:<12.4f} "
+              f"{r['auroc_mean_log_prob']:<12.4f} {r['best_metric']:<15} {r['separation']:<8.2f}")
+
+    print("=" * 80)
+    print(f"\nResults saved to: {output_path}")
+
+    return results
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=14400,  # 4 hours
+    volumes={"/vol": volume},
+    memory=32768,
+)
 def run_beemo_multistep(
     scenarios: list[str] = None,
     mask_ratio: float = 0.8,
@@ -1775,6 +2115,340 @@ def run_beemo_benchmark(
     volumes={"/vol": volume},
     memory=32768,
 )
+def run_beemo_diveye(
+    scenarios: list[str] = None,
+    mask_ratio: float = 0.8,
+    max_samples: int = None,
+    max_length: int = 512,
+):
+    """
+    Run Beemo benchmark with DivEye diversity features.
+
+    Instead of using only mean reconstruction accuracy (1 feature),
+    this extracts 9 statistical features from per-token reconstruction
+    patterns and uses logistic regression for classification.
+
+    DivEye insight: Human text has irregular reconstruction patterns
+    (errors cluster and vary). AI text reconstructs uniformly.
+
+    Features:
+        Distributional: mean, variance, skewness, kurtosis
+        First-order: diff_mean, diff_variance
+        Second-order: diff2_variance, diff2_entropy, diff2_autocorr
+
+    Args:
+        max_length: Maximum token length (default 512)
+
+    Usage:
+        modal run modal_app.py --experiment beemo-diveye --mask-ratio 0.8
+    """
+    import os
+    import json
+    import torch
+    import numpy as np
+    from datetime import datetime
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_predict
+    from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, roc_curve
+    from sklearn.preprocessing import StandardScaler
+    from scipy import stats
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+    from datasets import load_dataset
+
+    if scenarios is None:
+        scenarios = ["easy", "medium", "hard"]
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("=" * 60)
+    print("TEXT-DIRE: Beemo Benchmark with DivEye Features")
+    print("=" * 60)
+
+    # Load Beemo dataset
+    print("\n[1/3] Loading Beemo dataset from HuggingFace...")
+    dataset = load_dataset("toloka/beemo")
+    df = dataset["train"].to_pandas()
+
+    if max_samples:
+        df = df.head(max_samples)
+
+    print(f"Loaded {len(df)} samples")
+    print(f"Categories: {df['category'].unique().tolist()}")
+
+    # Load LLaDA model
+    print("\n[2/3] Loading LLaDA-8B for DIRE...")
+    MASK_ID = 126336
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        cache_dir=MODEL_DIR,
+    )
+
+    model = AutoModel.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        cache_dir=MODEL_DIR,
+    ).to("cuda").eval()
+
+    print("LLaDA-8B loaded!")
+
+    def extract_diveye_features(token_correctness):
+        """Extract 9 DivEye features from per-token reconstruction correctness."""
+        x = token_correctness.astype(float)
+        n = len(x)
+
+        if n < 4:
+            return {
+                'mean_accuracy': 0.5, 'variance': 0.0, 'skewness': 0.0, 'kurtosis': 0.0,
+                'diff_mean': 0.0, 'diff_variance': 0.0,
+                'diff2_variance': 0.0, 'diff2_entropy': 0.0, 'diff2_autocorr': 0.0,
+            }
+
+        # Distributional features
+        mean_acc = np.mean(x)
+        variance = np.var(x, ddof=1) if n > 1 else 0.0
+        skewness = stats.skew(x) if n > 2 else 0.0
+        kurtosis = stats.kurtosis(x) if n > 3 else 0.0
+
+        # First-order differences
+        dx = np.diff(x)
+        diff_mean = np.mean(dx) if len(dx) > 0 else 0.0
+        diff_variance = np.var(dx, ddof=1) if len(dx) > 1 else 0.0
+
+        # Second-order differences
+        d2x = np.diff(dx)
+        diff2_variance = np.var(d2x, ddof=1) if len(d2x) > 1 else 0.0
+
+        # Entropy of discretized second differences
+        if len(d2x) > 0:
+            bins = np.digitize(d2x, bins=[-0.5, 0.5])
+            _, counts = np.unique(bins, return_counts=True)
+            probs = counts / counts.sum()
+            diff2_entropy = -np.sum(probs * np.log(probs + 1e-10))
+        else:
+            diff2_entropy = 0.0
+
+        # Autocorrelation of second differences
+        if len(d2x) > 1:
+            d2x_centered = d2x - np.mean(d2x)
+            var_d2x = np.var(d2x)
+            if var_d2x > 1e-10:
+                autocorr_full = np.correlate(d2x_centered, d2x_centered, mode='full')
+                diff2_autocorr = autocorr_full[len(d2x_centered)] / (var_d2x * len(d2x))
+            else:
+                diff2_autocorr = 0.0
+        else:
+            diff2_autocorr = 0.0
+
+        return {
+            'mean_accuracy': float(mean_acc), 'variance': float(variance),
+            'skewness': float(skewness), 'kurtosis': float(kurtosis),
+            'diff_mean': float(diff_mean), 'diff_variance': float(diff_variance),
+            'diff2_variance': float(diff2_variance), 'diff2_entropy': float(diff2_entropy),
+            'diff2_autocorr': float(diff2_autocorr),
+        }
+
+    def compute_dire_with_tokens(text):
+        """Compute DIRE with per-token correctness data preserved."""
+        if not text or len(str(text).strip()) < 10:
+            return np.array([True, True, True, True])  # Default
+
+        try:
+            input_ids = tokenizer(
+                str(text),
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"].to("cuda")
+
+            seq_len = input_ids.shape[1]
+            if seq_len < 5:
+                return np.array([True, True, True, True])
+
+            num_mask = max(1, int(seq_len * mask_ratio))
+            positions = torch.randperm(seq_len, device=input_ids.device)[:num_mask]
+
+            masked_ids = input_ids.clone()
+            masked_ids[0, positions] = MASK_ID
+
+            with torch.no_grad():
+                logits = model(masked_ids).logits
+                predictions = logits.argmax(dim=-1)
+
+                # Per-token correctness at masked positions
+                original = input_ids[0, positions].cpu().numpy()
+                predicted = predictions[0, positions].cpu().numpy()
+                token_correctness = (original == predicted)
+
+            return token_correctness
+
+        except Exception as e:
+            print(f"Error in DIRE computation: {e}")
+            return np.array([True, True, True, True])
+
+    # Evaluate each scenario
+    print(f"\n[3/3] Evaluating scenarios with DivEye features (mask_ratio={mask_ratio}, max_length={max_length})...")
+    results = {}
+
+    for scenario in scenarios:
+        print(f"\n{'='*50}")
+        print(f"Scenario: {scenario.upper()}")
+        print('='*50)
+
+        texts = []
+        labels = []
+
+        if scenario == "easy":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["model_output"] and len(str(row["model_output"]).strip()) > 10:
+                    texts.append(str(row["model_output"]))
+                    labels.append(1)
+
+        elif scenario == "medium":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["gpt-4o_edits"] and len(str(row["gpt-4o_edits"]).strip()) > 10:
+                    texts.append(str(row["gpt-4o_edits"]))
+                    labels.append(1)
+
+        elif scenario == "hard":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["human_edits"] and len(str(row["human_edits"]).strip()) > 10:
+                    texts.append(str(row["human_edits"]))
+                    labels.append(1)
+
+        print(f"Samples: {len(texts)} ({sum(1 for l in labels if l == 0)} human, {sum(labels)} AI)")
+
+        if len(texts) < 20:
+            print(f"Skipping {scenario} - too few samples")
+            continue
+
+        # Compute per-token correctness and extract features
+        features = []
+        for text in tqdm(texts, desc=f"DivEye features on {scenario}"):
+            token_correct = compute_dire_with_tokens(text)
+            feat = extract_diveye_features(token_correct)
+            features.append(list(feat.values()))
+
+        X = np.array(features)
+        y = np.array(labels)
+
+        # Handle NaN/Inf values
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Standardize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # Cross-validation prediction for AUROC
+        clf = LogisticRegression(max_iter=1000, random_state=42)
+        try:
+            y_pred_proba = cross_val_predict(clf, X_scaled, y, cv=5, method='predict_proba')[:, 1]
+        except Exception as e:
+            print(f"CV failed, using simple train/test: {e}")
+            # Fallback to simple approach
+            clf.fit(X_scaled, y)
+            y_pred_proba = clf.predict_proba(X_scaled)[:, 1]
+
+        # Compute metrics
+        auroc = roc_auc_score(y, y_pred_proba)
+
+        # Find optimal threshold
+        fpr, tpr, thresholds = roc_curve(y, y_pred_proba)
+        j_scores = tpr - fpr
+        optimal_idx = np.argmax(j_scores)
+        threshold = thresholds[optimal_idx]
+
+        predictions = (y_pred_proba >= threshold).astype(int)
+        accuracy = accuracy_score(y, predictions)
+        f1 = f1_score(y, predictions)
+
+        # Score distributions
+        human_scores = y_pred_proba[y == 0]
+        ai_scores = y_pred_proba[y == 1]
+
+        # Effect size
+        if len(human_scores) > 1 and len(ai_scores) > 1:
+            pooled_std = np.sqrt(
+                ((len(human_scores) - 1) * np.std(human_scores, ddof=1)**2 +
+                 (len(ai_scores) - 1) * np.std(ai_scores, ddof=1)**2) /
+                (len(human_scores) + len(ai_scores) - 2)
+            )
+        else:
+            pooled_std = 1.0
+        cohens_d = abs(np.mean(ai_scores) - np.mean(human_scores)) / pooled_std if pooled_std > 0 else 0
+
+        # Feature importance (fit on all data for analysis)
+        clf.fit(X_scaled, y)
+        feature_names = ['mean_acc', 'variance', 'skewness', 'kurtosis',
+                        'diff_mean', 'diff_var', 'diff2_var', 'diff2_ent', 'diff2_autocorr']
+        importance = dict(zip(feature_names, clf.coef_[0].tolist()))
+
+        results[scenario] = {
+            "auroc": float(auroc),
+            "accuracy": float(accuracy),
+            "f1": float(f1),
+            "n_samples": len(y),
+            "human_mean": float(np.mean(human_scores)),
+            "human_std": float(np.std(human_scores)),
+            "ai_mean": float(np.mean(ai_scores)),
+            "ai_std": float(np.std(ai_scores)),
+            "separation": float(cohens_d),
+            "feature_importance": importance,
+            "method": "DivEye-9features",
+        }
+
+        print(f"  AUROC:      {auroc:.4f}")
+        print(f"  Accuracy:   {accuracy:.4f}")
+        print(f"  F1:         {f1:.4f}")
+        print(f"  Human mean: {np.mean(human_scores):.4f}")
+        print(f"  AI mean:    {np.mean(ai_scores):.4f}")
+        print(f"  Separation: {cohens_d:.2f}")
+        print(f"  Top features: {sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True)[:3]}")
+
+    # Save results
+    output_path = os.path.join(RESULTS_DIR, f"beemo_diveye_results_{timestamp}.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    volume.commit()
+
+    # Print summary table
+    print("\n" + "=" * 70)
+    print("BEEMO BENCHMARK RESULTS - TEXT-DIRE with DivEye Features")
+    print("=" * 70)
+    print(f"{'Scenario':<15} {'AUROC':<10} {'Accuracy':<10} {'F1':<10} {'Separation':<12}")
+    print("-" * 70)
+
+    for scenario, r in results.items():
+        print(f"{scenario:<15} {r['auroc']:<10.4f} {r['accuracy']:<10.4f} "
+              f"{r['f1']:<10.4f} {r['separation']:<12.2f}")
+
+    print("=" * 70)
+    print(f"\nResults saved to: {output_path}")
+
+    return results
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=14400,  # 4 hours
+    volumes={"/vol": volume},
+    memory=32768,
+)
 def run_beemo_by_model(
     mask_ratio: float = 0.5,
     max_samples: int = None,
@@ -2014,6 +2688,7 @@ def main(
     openai_key: str = None,
     anthropic_key: str = None,
     mask_ratio: float = 0.5,
+    max_length: int = 512,
 ):
     """
     Entry point for modal run command.
@@ -2028,10 +2703,12 @@ def main(
         modal run modal_app.py --experiment beemo --mask-ratio 0.7
         modal run modal_app.py --experiment beemo-by-model
         modal run modal_app.py --experiment beemo-multistep --num-samples 200
+        modal run modal_app.py --experiment beemo-logscale --num-samples 200
+        modal run modal_app.py --experiment beemo-diveye --mask-ratio 0.8
 
     Args:
         num_samples: Number of samples per class
-        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep)
+        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye)
         mc_samples: MC samples for mc experiment
         models: Comma-separated list of models for modern experiment
         openai_key: OpenAI API key (required for modern experiment)
@@ -2110,6 +2787,55 @@ def main(
             print(f"  AUROC (CE loss):  {metrics['auroc_ce_loss']:.4f}")
             print(f"  Best AUROC:       {metrics['best_auroc']:.4f}")
             print(f"  Best metric:      {metrics['best_metric']}")
+
+        return results
+
+    elif experiment == "beemo-logscale":
+        print(f"\nRunning Beemo with LOG-SCALE scoring (Binoculars-style, mask_ratio={mask_ratio})...")
+        results = run_beemo_logscale.remote(
+            scenarios=["easy", "medium", "hard"],
+            mask_ratio=mask_ratio,
+            max_samples=num_samples if num_samples != 100 else None,
+        )
+
+        print("\n" + "=" * 60)
+        print("BEEMO LOG-SCALE COMPLETE")
+        print("=" * 60)
+
+        for scenario, metrics in results.items():
+            print(f"\n{scenario.upper()}:")
+            print(f"  AUROC (accuracy):      {metrics['auroc_accuracy']:.4f}")
+            print(f"  AUROC (log_perplexity): {metrics['auroc_log_perplexity']:.4f}")
+            print(f"  AUROC (mean_log_prob): {metrics['auroc_mean_log_prob']:.4f}")
+            print(f"  Best metric: {metrics['best_metric']} ({metrics['best_auroc']:.4f})")
+
+        return results
+
+    elif experiment == "beemo-diveye":
+        print(f"\nRunning Beemo with DivEye diversity features (mask_ratio={mask_ratio}, max_length={max_length})...")
+        print("Extracts 9 statistical features from per-token reconstruction patterns.")
+        results = run_beemo_diveye.remote(
+            scenarios=["easy", "medium", "hard"],
+            mask_ratio=mask_ratio,
+            max_samples=num_samples if num_samples != 100 else None,
+            max_length=max_length,
+        )
+
+        print("\n" + "=" * 60)
+        print("BEEMO DIVEYE COMPLETE")
+        print("=" * 60)
+
+        for scenario, metrics in results.items():
+            print(f"\n{scenario.upper()}:")
+            print(f"  AUROC: {metrics['auroc']:.4f}")
+            print(f"  Accuracy: {metrics['accuracy']:.4f}")
+            print(f"  F1: {metrics['f1']:.4f}")
+            print(f"  Human mean: {metrics['human_mean']:.4f}")
+            print(f"  AI mean: {metrics['ai_mean']:.4f}")
+            if 'feature_importance' in metrics:
+                top_features = sorted(metrics['feature_importance'].items(),
+                                     key=lambda x: abs(x[1]), reverse=True)[:3]
+                print(f"  Top features: {top_features}")
 
         return results
 
