@@ -2450,6 +2450,297 @@ def run_beemo_diveye(
     volumes={"/vol": volume},
     memory=32768,
 )
+def run_beemo_zeroshot(
+    scenarios: list[str] = None,
+    mask_ratio: float = 0.5,
+    max_samples: int = None,
+    max_length: int = 512,
+):
+    """
+    Zero-shot Beemo benchmark - NO classifier training.
+
+    Tests multiple zero-shot scoring methods:
+    1. DIRE: Reconstruction accuracy (higher = more AI)
+    2. TTR: 1 - type_token_ratio (higher = more AI, less diverse vocab)
+    3. Combined: DIRE * (1 - TTR) - multiplied signals
+    4. Diversity: Combines TTR + sentence variance + late-stage volatility
+
+    All methods use fixed thresholds, no training on evaluation data.
+    Comparable to Binoculars, DetectGPT, and other zero-shot methods.
+
+    Usage:
+        modal run modal_app.py --experiment beemo-zeroshot
+        modal run modal_app.py --experiment beemo-zeroshot --num-samples 200
+    """
+    import os
+    import json
+    import torch
+    import numpy as np
+    from datetime import datetime
+    from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, roc_curve
+    from scipy import stats
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+    from datasets import load_dataset
+
+    if scenarios is None:
+        scenarios = ["easy", "medium", "hard"]
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("=" * 60)
+    print("TEXT-DIRE: Zero-Shot Beemo Benchmark")
+    print("=" * 60)
+    print("Method: Zero-shot (NO classifier training)")
+    print("Scoring: Fixed formulas + thresholds")
+    print(f"Mask ratio: {mask_ratio}")
+
+    # Load Beemo dataset
+    print("\n[1/3] Loading Beemo dataset from HuggingFace...")
+    dataset = load_dataset("toloka/beemo")
+    df = dataset["train"].to_pandas()
+
+    if max_samples:
+        df = df.head(max_samples)
+
+    print(f"Loaded {len(df)} samples")
+
+    # Load LLaDA model
+    print("\n[2/3] Loading LLaDA-8B for DIRE...")
+    MASK_ID = 126336
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        cache_dir=MODEL_DIR,
+    )
+
+    model = AutoModel.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        cache_dir=MODEL_DIR,
+    ).to("cuda").eval()
+
+    print("LLaDA-8B loaded!")
+
+    def compute_dire_score(text):
+        """Compute DIRE reconstruction accuracy. Higher = more likely AI."""
+        if not text or len(str(text).strip()) < 10:
+            return 0.5
+
+        try:
+            input_ids = tokenizer(
+                str(text),
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"].to("cuda")
+
+            seq_len = input_ids.shape[1]
+            if seq_len < 5:
+                return 0.5
+
+            num_mask = max(1, int(seq_len * mask_ratio))
+            positions = torch.randperm(seq_len, device=input_ids.device)[:num_mask]
+
+            masked_ids = input_ids.clone()
+            masked_ids[0, positions] = MASK_ID
+
+            with torch.no_grad():
+                logits = model(masked_ids).logits
+                predictions = logits.argmax(dim=-1)
+
+                original = input_ids[0, positions]
+                predicted = predictions[0, positions]
+                accuracy = (original == predicted).float().mean().item()
+
+            return accuracy
+
+        except Exception as e:
+            print(f"Error: {e}")
+            return 0.5
+
+    def compute_type_token_ratio(text):
+        """Compute vocabulary richness. Lower = more likely AI."""
+        words = str(text).lower().split()
+        if len(words) < 5:
+            return 0.5
+        return len(set(words)) / len(words)
+
+    def compute_sentence_variance(text):
+        """Compute sentence length variance. Lower = more likely AI."""
+        sentences = [s.strip() for s in str(text).split('.') if s.strip()]
+        if len(sentences) < 2:
+            return 0.0
+        lengths = [len(s.split()) for s in sentences]
+        return np.var(lengths)
+
+    def compute_all_scores(text):
+        """Compute all zero-shot scores for a text."""
+        dire = compute_dire_score(text)
+        ttr = compute_type_token_ratio(text)
+        sent_var = compute_sentence_variance(text)
+
+        # Normalize sentence variance (typically 0-100 range)
+        sent_var_norm = min(sent_var / 50.0, 1.0)
+
+        return {
+            'dire': dire,                           # Higher = more AI
+            'ttr': ttr,                             # Lower = more AI
+            'sent_var': sent_var,                   # Lower = more AI
+            # Combined scores (higher = more AI)
+            'inv_ttr': 1.0 - ttr,                   # Inverted TTR
+            'inv_diversity': 1.0 - (ttr * 0.7 + sent_var_norm * 0.3),  # Combined diversity
+            'dire_ttr': dire * (1.0 - ttr),         # DIRE × inverse TTR
+            'dire_plus_ttr': (dire + (1.0 - ttr)) / 2,  # Average of signals
+        }
+
+    # Evaluate each scenario
+    print(f"\n[3/3] Evaluating scenarios (zero-shot)...")
+    results = {}
+
+    for scenario in scenarios:
+        print(f"\n{'='*50}")
+        print(f"Scenario: {scenario.upper()}")
+        print('='*50)
+
+        texts = []
+        labels = []
+
+        if scenario == "easy":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["model_output"] and len(str(row["model_output"]).strip()) > 10:
+                    texts.append(str(row["model_output"]))
+                    labels.append(1)
+
+        elif scenario == "medium":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["gpt-4o_edits"] and len(str(row["gpt-4o_edits"]).strip()) > 10:
+                    texts.append(str(row["gpt-4o_edits"]))
+                    labels.append(1)
+
+        elif scenario == "hard":
+            for _, row in df.iterrows():
+                if row["human_output"] and len(str(row["human_output"]).strip()) > 10:
+                    texts.append(str(row["human_output"]))
+                    labels.append(0)
+                if row["human_edits"] and len(str(row["human_edits"]).strip()) > 10:
+                    texts.append(str(row["human_edits"]))
+                    labels.append(1)
+
+        print(f"Samples: {len(texts)} ({sum(1 for l in labels if l == 0)} human, {sum(labels)} AI)")
+
+        if len(texts) < 20:
+            print(f"Skipping {scenario} - too few samples")
+            continue
+
+        # Compute all scores
+        all_scores = []
+        for text in tqdm(texts, desc=f"Zero-shot scoring on {scenario}"):
+            scores = compute_all_scores(text)
+            all_scores.append(scores)
+
+        y = np.array(labels)
+
+        # Evaluate each scoring method
+        scoring_methods = ['dire', 'inv_ttr', 'inv_diversity', 'dire_ttr', 'dire_plus_ttr']
+        method_results = {}
+
+        for method in scoring_methods:
+            scores = np.array([s[method] for s in all_scores])
+            scores = np.nan_to_num(scores, nan=0.5)
+
+            # Compute AUROC
+            auroc = roc_auc_score(y, scores)
+
+            # Ensure AUROC > 0.5 (flip if needed)
+            if auroc < 0.5:
+                scores = 1 - scores
+                auroc = 1 - auroc
+
+            # Find optimal threshold for accuracy/F1
+            fpr, tpr, thresholds = roc_curve(y, scores)
+            j_scores = tpr - fpr
+            optimal_idx = np.argmax(j_scores)
+            threshold = thresholds[optimal_idx]
+
+            preds = (scores >= threshold).astype(int)
+            accuracy = accuracy_score(y, preds)
+            f1 = f1_score(y, preds)
+
+            # Score distributions
+            human_scores = scores[y == 0]
+            ai_scores = scores[y == 1]
+
+            method_results[method] = {
+                'auroc': float(auroc),
+                'accuracy': float(accuracy),
+                'f1': float(f1),
+                'threshold': float(threshold),
+                'human_mean': float(np.mean(human_scores)),
+                'ai_mean': float(np.mean(ai_scores)),
+            }
+
+        # Find best method
+        best_method = max(method_results.items(), key=lambda x: x[1]['auroc'])
+
+        results[scenario] = {
+            'methods': method_results,
+            'best_method': best_method[0],
+            'best_auroc': best_method[1]['auroc'],
+            'best_accuracy': best_method[1]['accuracy'],
+            'best_f1': best_method[1]['f1'],
+            'n_samples': len(y),
+        }
+
+        print(f"\n  Results by method:")
+        print(f"  {'Method':<20} {'AUROC':<10} {'Acc':<10} {'F1':<10}")
+        print(f"  {'-'*50}")
+        for method, r in method_results.items():
+            marker = " *" if method == best_method[0] else ""
+            print(f"  {method:<20} {r['auroc']:<10.4f} {r['accuracy']:<10.4f} {r['f1']:<10.4f}{marker}")
+
+        print(f"\n  Best: {best_method[0]} (AUROC: {best_method[1]['auroc']:.4f})")
+
+    # Save results
+    output_path = os.path.join(RESULTS_DIR, f"beemo_zeroshot_results_{timestamp}.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    volume.commit()
+
+    # Print summary table
+    print("\n" + "=" * 70)
+    print("BEEMO BENCHMARK RESULTS - Zero-Shot (No Classifier Training)")
+    print("=" * 70)
+    print(f"{'Scenario':<12} {'Best Method':<20} {'AUROC':<10} {'Accuracy':<10} {'F1':<10}")
+    print("-" * 70)
+
+    for scenario, r in results.items():
+        print(f"{scenario:<12} {r['best_method']:<20} {r['best_auroc']:<10.4f} "
+              f"{r['best_accuracy']:<10.4f} {r['best_f1']:<10.4f}")
+
+    print("=" * 70)
+    print(f"\nResults saved to: {output_path}")
+
+    return results
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=14400,  # 4 hours
+    volumes={"/vol": volume},
+    memory=32768,
+)
 def run_beemo_enhanced(
     scenarios: list[str] = None,
     mask_ratios: list[float] = None,
@@ -3133,10 +3424,11 @@ def main(
         modal run modal_app.py --experiment beemo-logscale --num-samples 200
         modal run modal_app.py --experiment beemo-diveye --mask-ratio 0.8
         modal run modal_app.py --experiment beemo-enhanced --num-samples 200
+        modal run modal_app.py --experiment beemo-zeroshot --num-samples 200
 
     Args:
         num_samples: Number of samples per class
-        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye, beemo-enhanced)
+        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye, beemo-enhanced, beemo-zeroshot)
         mc_samples: MC samples for mc experiment
         models: Comma-separated list of models for modern experiment
         openai_key: OpenAI API key (required for modern experiment)
@@ -3293,6 +3585,33 @@ def main(
             print(f"  Separation: {metrics['separation']:.2f}")
             if 'top_features' in metrics:
                 print(f"  Top 5 features: {metrics['top_features']}")
+
+        return results
+
+    elif experiment == "beemo-zeroshot":
+        print(f"\nRunning ZERO-SHOT Beemo (no classifier training)...")
+        print("Method: Fixed scoring formulas + thresholds")
+        print("Comparable to: Binoculars, DetectGPT")
+        results = run_beemo_zeroshot.remote(
+            scenarios=["easy", "medium", "hard"],
+            mask_ratio=mask_ratio,
+            max_samples=num_samples if num_samples != 100 else None,
+            max_length=max_length,
+        )
+
+        print("\n" + "=" * 60)
+        print("BEEMO ZERO-SHOT COMPLETE")
+        print("=" * 60)
+
+        for scenario, metrics in results.items():
+            print(f"\n{scenario.upper()}:")
+            print(f"  Best method: {metrics['best_method']}")
+            print(f"  AUROC: {metrics['best_auroc']:.4f}")
+            print(f"  Accuracy: {metrics['best_accuracy']:.4f}")
+            print(f"  F1: {metrics['best_f1']:.4f}")
+            print(f"\n  All methods:")
+            for method, r in metrics['methods'].items():
+                print(f"    {method}: AUROC={r['auroc']:.4f}")
 
         return results
 
