@@ -4,12 +4,18 @@ Text-DIRE: Core computation logic for Diffusion Reconstruction Error.
 The hypothesis: A text diffusion model trained on human text will reconstruct
 human-written text more accurately than AI-generated text, because AI text
 lies "off-manifold" from natural human writing.
+
+Enhanced with:
+- Monte Carlo DIRE estimation for stability
+- Multi-metric scoring (top-k accuracy, entropy, perplexity)
+- Ensemble scoring across multiple mask ratios
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -24,6 +30,39 @@ class DIREResult:
     # Optional: per-token details
     correct_predictions: Optional[list] = None
     confidence_scores: Optional[list] = None
+
+    # Extended metrics
+    top_k_accuracy: Optional[dict] = None  # {5: acc, 10: acc}
+    mean_entropy: Optional[float] = None
+    reconstruction_perplexity: Optional[float] = None
+    cross_entropy_loss: Optional[float] = None
+
+
+@dataclass
+class MCDIREResult:
+    """Result of Monte Carlo DIRE estimation."""
+    mean: float
+    std: float
+    ci_95_lower: float
+    ci_95_upper: float
+    samples: list[float] = field(default_factory=list)
+    num_samples: int = 0
+
+    # Extended metrics with uncertainty
+    accuracy_mean: Optional[float] = None
+    accuracy_std: Optional[float] = None
+    ce_loss_mean: Optional[float] = None
+    ce_loss_std: Optional[float] = None
+
+
+@dataclass
+class EnsembleDIREResult:
+    """Result of ensemble DIRE scoring across multiple mask ratios."""
+    weighted_score: float
+    individual_scores: dict[float, float]  # mask_ratio -> score
+    weights: dict[float, float]  # mask_ratio -> weight
+    best_mask_ratio: float
+    best_score: float
 
 
 def mask_tokens(
@@ -74,6 +113,61 @@ def mask_tokens(
     return masked_ids, mask_positions
 
 
+def compute_extended_metrics(
+    logits: torch.Tensor,
+    original_ids: torch.Tensor,
+    mask_positions: torch.Tensor,
+) -> dict:
+    """
+    Compute extended metrics from model logits.
+
+    Args:
+        logits: Model output logits [batch, seq_len, vocab_size]
+        original_ids: Original token IDs [batch, seq_len]
+        mask_positions: Boolean mask of masked positions [batch, seq_len]
+
+    Returns:
+        Dictionary with extended metrics
+    """
+    metrics = {}
+
+    # Get logits at masked positions
+    masked_logits = logits[mask_positions]  # [num_masked, vocab_size]
+    masked_targets = original_ids[mask_positions]  # [num_masked]
+
+    if len(masked_logits) == 0:
+        return metrics
+
+    # Probabilities
+    probs = F.softmax(masked_logits, dim=-1)
+    log_probs = F.log_softmax(masked_logits, dim=-1)
+
+    # Top-k accuracy
+    for k in [5, 10]:
+        top_k_preds = masked_logits.topk(k, dim=-1).indices
+        top_k_correct = (top_k_preds == masked_targets.unsqueeze(-1)).any(dim=-1)
+        metrics[f"top_{k}_accuracy"] = top_k_correct.float().mean().item()
+
+    # Entropy of predictions
+    entropy = -(probs * log_probs).sum(dim=-1)
+    metrics["mean_entropy"] = entropy.mean().item()
+    metrics["std_entropy"] = entropy.std().item()
+
+    # Cross-entropy loss
+    ce_loss = F.cross_entropy(masked_logits, masked_targets)
+    metrics["cross_entropy_loss"] = ce_loss.item()
+
+    # Reconstruction perplexity
+    metrics["reconstruction_perplexity"] = np.exp(ce_loss.item())
+
+    # Confidence of correct predictions
+    correct_probs = probs[torch.arange(len(masked_targets)), masked_targets]
+    metrics["mean_confidence"] = correct_probs.mean().item()
+    metrics["std_confidence"] = correct_probs.std().item()
+
+    return metrics
+
+
 def compute_dire_score(
     model,
     tokenizer,
@@ -82,6 +176,7 @@ def compute_dire_score(
     max_length: int = 512,
     num_runs: int = 1,
     aggregate: str = "mean",
+    compute_extended: bool = False,
 ) -> DIREResult:
     """
     Compute Text-DIRE score for a single text.
@@ -98,6 +193,7 @@ def compute_dire_score(
         max_length: Maximum sequence length
         num_runs: Number of times to run with different masks (for stability)
         aggregate: How to aggregate multiple runs ("mean" or "median")
+        compute_extended: Whether to compute extended metrics (top-k, entropy, etc.)
 
     Returns:
         DIREResult with accuracy and error metrics
@@ -165,13 +261,209 @@ def compute_dire_score(
 
     num_masked = mask_positions.sum().item()
 
-    return DIREResult(
+    # Build result
+    result = DIREResult(
         token_accuracy=token_accuracy,
         reconstruction_error=1.0 - token_accuracy,
         num_masked=num_masked,
         num_total=seq_len,
         mask_ratio=mask_ratio,
         correct_predictions=all_correct if num_runs == 1 else None,
+    )
+
+    # Compute extended metrics on last run if requested
+    if compute_extended and num_runs == 1:
+        # Re-run to get logits for extended metrics
+        with torch.no_grad():
+            outputs = model(masked_ids)
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            elif isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+
+            extended = compute_extended_metrics(logits, original_ids, mask_positions)
+
+            result.top_k_accuracy = {
+                5: extended.get("top_5_accuracy"),
+                10: extended.get("top_10_accuracy"),
+            }
+            result.mean_entropy = extended.get("mean_entropy")
+            result.reconstruction_perplexity = extended.get("reconstruction_perplexity")
+            result.cross_entropy_loss = extended.get("cross_entropy_loss")
+
+    return result
+
+
+def compute_dire_score_mc(
+    model,
+    tokenizer,
+    text: str,
+    mask_ratio: float = 0.5,
+    mc_samples: int = 32,
+    max_length: int = 512,
+) -> MCDIREResult:
+    """
+    Compute Text-DIRE score with Monte Carlo estimation for stability.
+
+    Multiple random maskings are performed to get a stable estimate
+    with confidence intervals.
+
+    Args:
+        model: The diffusion model (e.g., LLaDA)
+        tokenizer: The tokenizer
+        text: Input text to evaluate
+        mask_ratio: Fraction of tokens to mask
+        mc_samples: Number of Monte Carlo samples
+        max_length: Maximum sequence length
+
+    Returns:
+        MCDIREResult with mean, std, and 95% CI
+    """
+    device = next(model.parameters()).device
+
+    # Tokenize once
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+    ).to(device)
+
+    original_ids = inputs["input_ids"]
+    seq_len = original_ids.shape[1]
+
+    # Get mask token ID
+    mask_token_id = getattr(tokenizer, 'mask_token_id', None)
+    if mask_token_id is None:
+        mask_token_id = getattr(tokenizer, 'mask_id', None)
+    if mask_token_id is None:
+        mask_token_id = 126336  # LLaDA default
+
+    accuracies = []
+    ce_losses = []
+
+    for _ in range(mc_samples):
+        # Create new random mask
+        masked_ids, mask_positions = mask_tokens(
+            original_ids,
+            mask_ratio,
+            mask_token_id,
+        )
+
+        with torch.no_grad():
+            outputs = model(masked_ids)
+
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            elif isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+
+            predictions = logits.argmax(dim=-1)
+
+            # Accuracy
+            original_tokens = original_ids[mask_positions]
+            predicted_tokens = predictions[mask_positions]
+            correct = (predicted_tokens == original_tokens).float()
+            accuracies.append(correct.mean().item())
+
+            # Cross-entropy loss
+            ce_loss = F.cross_entropy(
+                logits[mask_positions],
+                original_ids[mask_positions],
+            ).item()
+            ce_losses.append(ce_loss)
+
+    # Compute statistics
+    accuracies = np.array(accuracies)
+    errors = 1.0 - accuracies
+    ce_losses = np.array(ce_losses)
+
+    return MCDIREResult(
+        mean=float(np.mean(errors)),
+        std=float(np.std(errors)),
+        ci_95_lower=float(np.percentile(errors, 2.5)),
+        ci_95_upper=float(np.percentile(errors, 97.5)),
+        samples=errors.tolist(),
+        num_samples=mc_samples,
+        accuracy_mean=float(np.mean(accuracies)),
+        accuracy_std=float(np.std(accuracies)),
+        ce_loss_mean=float(np.mean(ce_losses)),
+        ce_loss_std=float(np.std(ce_losses)),
+    )
+
+
+def ensemble_dire_score(
+    model,
+    tokenizer,
+    text: str,
+    mask_ratios: list[float] = None,
+    weights: list[float] = None,
+    mc_samples: int = 4,
+    max_length: int = 512,
+) -> EnsembleDIREResult:
+    """
+    Compute ensemble DIRE score combining multiple mask ratios.
+
+    Args:
+        model: The diffusion model
+        tokenizer: The tokenizer
+        text: Input text to evaluate
+        mask_ratios: List of mask ratios to combine (default: [0.3, 0.5, 0.7])
+        weights: Weights for each ratio (default: [0.2, 0.3, 0.5])
+        mc_samples: MC samples per mask ratio for stability
+        max_length: Maximum sequence length
+
+    Returns:
+        EnsembleDIREResult with weighted score and individual scores
+    """
+    if mask_ratios is None:
+        mask_ratios = [0.3, 0.5, 0.7]
+
+    if weights is None:
+        # Higher weight on higher mask ratios (harder reconstruction)
+        weights = [0.2, 0.3, 0.5]
+
+    if len(weights) != len(mask_ratios):
+        raise ValueError("weights must have same length as mask_ratios")
+
+    # Normalize weights
+    weight_sum = sum(weights)
+    weights = [w / weight_sum for w in weights]
+
+    individual_scores = {}
+    weight_dict = {}
+
+    for ratio, weight in zip(mask_ratios, weights):
+        # Use MC estimation for each ratio
+        mc_result = compute_dire_score_mc(
+            model, tokenizer, text,
+            mask_ratio=ratio,
+            mc_samples=mc_samples,
+            max_length=max_length,
+        )
+        individual_scores[ratio] = mc_result.mean
+        weight_dict[ratio] = weight
+
+    # Compute weighted score
+    weighted_score = sum(
+        individual_scores[ratio] * weight_dict[ratio]
+        for ratio in mask_ratios
+    )
+
+    # Find best performing ratio
+    best_ratio = max(individual_scores, key=individual_scores.get)
+
+    return EnsembleDIREResult(
+        weighted_score=weighted_score,
+        individual_scores=individual_scores,
+        weights=weight_dict,
+        best_mask_ratio=best_ratio,
+        best_score=individual_scores[best_ratio],
     )
 
 
@@ -227,6 +519,7 @@ class TextDIRE:
         text: str,
         mask_ratio: float = 0.5,
         max_length: int = 512,
+        compute_extended: bool = False,
     ) -> DIREResult:
         """Compute DIRE score for a single text."""
         return compute_dire_score(
@@ -234,6 +527,43 @@ class TextDIRE:
             self.tokenizer,
             text,
             mask_ratio=mask_ratio,
+            max_length=max_length,
+            compute_extended=compute_extended,
+        )
+
+    def compute_score_mc(
+        self,
+        text: str,
+        mask_ratio: float = 0.5,
+        mc_samples: int = 32,
+        max_length: int = 512,
+    ) -> MCDIREResult:
+        """Compute DIRE score with Monte Carlo estimation."""
+        return compute_dire_score_mc(
+            self.model,
+            self.tokenizer,
+            text,
+            mask_ratio=mask_ratio,
+            mc_samples=mc_samples,
+            max_length=max_length,
+        )
+
+    def compute_ensemble_score(
+        self,
+        text: str,
+        mask_ratios: list[float] = None,
+        weights: list[float] = None,
+        mc_samples: int = 4,
+        max_length: int = 512,
+    ) -> EnsembleDIREResult:
+        """Compute ensemble DIRE score across multiple mask ratios."""
+        return ensemble_dire_score(
+            self.model,
+            self.tokenizer,
+            text,
+            mask_ratios=mask_ratios,
+            weights=weights,
+            mc_samples=mc_samples,
             max_length=max_length,
         )
 

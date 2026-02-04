@@ -418,6 +418,430 @@ def interpret_cohens_d(d: float) -> str:
         return "large"
 
 
+# =============================================================================
+# Bootstrap Confidence Intervals
+# =============================================================================
+
+def bootstrap_auroc_ci(
+    labels: list[int],
+    scores: list[float],
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    random_state: int = 42,
+) -> dict:
+    """
+    Compute bootstrap confidence interval for AUROC.
+
+    Args:
+        labels: True labels
+        scores: Prediction scores
+        n_bootstrap: Number of bootstrap samples
+        confidence: Confidence level (e.g., 0.95 for 95% CI)
+        random_state: Random seed
+
+    Returns:
+        Dictionary with point estimate and CI bounds
+    """
+    from sklearn.metrics import roc_auc_score
+
+    np.random.seed(random_state)
+
+    labels = np.array(labels)
+    scores = np.array(scores)
+    n_samples = len(labels)
+
+    # Point estimate
+    point_auroc = roc_auc_score(labels, scores)
+    if point_auroc < 0.5:
+        scores = -scores
+        point_auroc = 1 - point_auroc
+
+    # Bootstrap
+    bootstrap_aurocs = []
+
+    for _ in range(n_bootstrap):
+        # Sample with replacement
+        indices = np.random.choice(n_samples, size=n_samples, replace=True)
+        boot_labels = labels[indices]
+        boot_scores = scores[indices]
+
+        # Skip if only one class
+        if len(np.unique(boot_labels)) < 2:
+            continue
+
+        try:
+            auroc = roc_auc_score(boot_labels, boot_scores)
+            if auroc < 0.5:
+                auroc = 1 - auroc
+            bootstrap_aurocs.append(auroc)
+        except Exception:
+            continue
+
+    bootstrap_aurocs = np.array(bootstrap_aurocs)
+
+    # Compute CI
+    alpha = 1 - confidence
+    lower = np.percentile(bootstrap_aurocs, alpha / 2 * 100)
+    upper = np.percentile(bootstrap_aurocs, (1 - alpha / 2) * 100)
+
+    return {
+        "auroc": point_auroc,
+        "ci_lower": lower,
+        "ci_upper": upper,
+        "confidence": confidence,
+        "std": np.std(bootstrap_aurocs),
+        "n_bootstrap": len(bootstrap_aurocs),
+    }
+
+
+def bootstrap_metric_ci(
+    labels: list[int],
+    predictions: list[int],
+    metric_fn,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    random_state: int = 42,
+) -> dict:
+    """
+    Compute bootstrap CI for any metric function.
+
+    Args:
+        labels: True labels
+        predictions: Predicted labels
+        metric_fn: Function(labels, predictions) -> float
+        n_bootstrap: Number of bootstrap samples
+        confidence: Confidence level
+        random_state: Random seed
+
+    Returns:
+        Dictionary with point estimate and CI bounds
+    """
+    np.random.seed(random_state)
+
+    labels = np.array(labels)
+    predictions = np.array(predictions)
+    n_samples = len(labels)
+
+    # Point estimate
+    point_estimate = metric_fn(labels, predictions)
+
+    # Bootstrap
+    bootstrap_values = []
+
+    for _ in range(n_bootstrap):
+        indices = np.random.choice(n_samples, size=n_samples, replace=True)
+        boot_labels = labels[indices]
+        boot_preds = predictions[indices]
+
+        try:
+            value = metric_fn(boot_labels, boot_preds)
+            bootstrap_values.append(value)
+        except Exception:
+            continue
+
+    bootstrap_values = np.array(bootstrap_values)
+
+    alpha = 1 - confidence
+    lower = np.percentile(bootstrap_values, alpha / 2 * 100)
+    upper = np.percentile(bootstrap_values, (1 - alpha / 2) * 100)
+
+    return {
+        "estimate": point_estimate,
+        "ci_lower": lower,
+        "ci_upper": upper,
+        "confidence": confidence,
+        "std": np.std(bootstrap_values),
+    }
+
+
+# =============================================================================
+# Statistical Tests for Method Comparison
+# =============================================================================
+
+def mcnemar_test(
+    labels: list[int],
+    predictions_a: list[int],
+    predictions_b: list[int],
+) -> dict:
+    """
+    McNemar's test for comparing two classifiers.
+
+    Tests whether the disagreement between two classifiers is significant.
+
+    Args:
+        labels: True labels
+        predictions_a: Predictions from classifier A
+        predictions_b: Predictions from classifier B
+
+    Returns:
+        Dictionary with test statistic and p-value
+    """
+    from scipy import stats
+
+    labels = np.array(labels)
+    predictions_a = np.array(predictions_a)
+    predictions_b = np.array(predictions_b)
+
+    # Build contingency table
+    # b = A wrong, B right
+    # c = A right, B wrong
+    correct_a = predictions_a == labels
+    correct_b = predictions_b == labels
+
+    b = np.sum(~correct_a & correct_b)  # A wrong, B right
+    c = np.sum(correct_a & ~correct_b)  # A right, B wrong
+
+    # McNemar test statistic (with continuity correction)
+    if b + c == 0:
+        return {
+            "statistic": 0,
+            "p_value": 1.0,
+            "b": b,
+            "c": c,
+            "significant": False,
+        }
+
+    statistic = (abs(b - c) - 1) ** 2 / (b + c)
+    p_value = 1 - stats.chi2.cdf(statistic, df=1)
+
+    return {
+        "statistic": statistic,
+        "p_value": p_value,
+        "b": int(b),
+        "c": int(c),
+        "significant": p_value < 0.05,
+    }
+
+
+def compare_aurocs_delong(
+    labels: list[int],
+    scores_a: list[float],
+    scores_b: list[float],
+) -> dict:
+    """
+    DeLong test for comparing two AUROC values.
+
+    Args:
+        labels: True labels
+        scores_a: Scores from method A
+        scores_b: Scores from method B
+
+    Returns:
+        Dictionary with test results
+    """
+    from scipy import stats
+
+    labels = np.array(labels)
+    scores_a = np.array(scores_a)
+    scores_b = np.array(scores_b)
+
+    # Compute AUROCs
+    from sklearn.metrics import roc_auc_score
+
+    auroc_a = roc_auc_score(labels, scores_a)
+    auroc_b = roc_auc_score(labels, scores_b)
+
+    # Handle inverted scores
+    if auroc_a < 0.5:
+        scores_a = -scores_a
+        auroc_a = 1 - auroc_a
+    if auroc_b < 0.5:
+        scores_b = -scores_b
+        auroc_b = 1 - auroc_b
+
+    # Simplified DeLong variance estimation via bootstrap
+    n_bootstrap = 1000
+    auroc_diffs = []
+
+    n = len(labels)
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(n, size=n, replace=True)
+        if len(np.unique(labels[idx])) < 2:
+            continue
+
+        try:
+            a_auroc = roc_auc_score(labels[idx], scores_a[idx])
+            b_auroc = roc_auc_score(labels[idx], scores_b[idx])
+            auroc_diffs.append(a_auroc - b_auroc)
+        except Exception:
+            continue
+
+    if not auroc_diffs:
+        return {
+            "auroc_a": auroc_a,
+            "auroc_b": auroc_b,
+            "difference": auroc_a - auroc_b,
+            "p_value": 1.0,
+            "significant": False,
+        }
+
+    auroc_diffs = np.array(auroc_diffs)
+    diff_mean = np.mean(auroc_diffs)
+    diff_std = np.std(auroc_diffs)
+
+    # Z-test
+    z_score = diff_mean / diff_std if diff_std > 0 else 0
+    p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
+
+    return {
+        "auroc_a": auroc_a,
+        "auroc_b": auroc_b,
+        "difference": auroc_a - auroc_b,
+        "z_score": z_score,
+        "p_value": p_value,
+        "significant": p_value < 0.05,
+    }
+
+
+# =============================================================================
+# Multiple Comparison Correction
+# =============================================================================
+
+def bonferroni_correction(
+    p_values: list[float],
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Apply Bonferroni correction for multiple comparisons.
+
+    Args:
+        p_values: List of p-values
+        alpha: Significance level
+
+    Returns:
+        Dictionary with corrected threshold and significant tests
+    """
+    n_tests = len(p_values)
+    corrected_alpha = alpha / n_tests
+
+    significant = [p < corrected_alpha for p in p_values]
+
+    return {
+        "original_alpha": alpha,
+        "corrected_alpha": corrected_alpha,
+        "n_tests": n_tests,
+        "p_values": p_values,
+        "significant": significant,
+        "n_significant": sum(significant),
+    }
+
+
+def benjamini_hochberg(
+    p_values: list[float],
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Benjamini-Hochberg procedure for FDR control.
+
+    Args:
+        p_values: List of p-values
+        alpha: False discovery rate
+
+    Returns:
+        Dictionary with adjusted p-values and significant tests
+    """
+    n_tests = len(p_values)
+    sorted_idx = np.argsort(p_values)
+    sorted_p = np.array(p_values)[sorted_idx]
+
+    # BH adjusted p-values
+    adjusted = np.zeros(n_tests)
+    for i in range(n_tests - 1, -1, -1):
+        if i == n_tests - 1:
+            adjusted[i] = sorted_p[i]
+        else:
+            adjusted[i] = min(adjusted[i + 1], sorted_p[i] * n_tests / (i + 1))
+
+    # Map back to original order
+    adjusted_original = np.zeros(n_tests)
+    adjusted_original[sorted_idx] = adjusted
+
+    significant = adjusted_original < alpha
+
+    return {
+        "alpha": alpha,
+        "n_tests": n_tests,
+        "p_values": p_values,
+        "adjusted_p_values": adjusted_original.tolist(),
+        "significant": significant.tolist(),
+        "n_significant": sum(significant),
+    }
+
+
+def comprehensive_evaluation(
+    labels: list[int],
+    scores: list[float],
+    method_name: str = "Method",
+    n_bootstrap: int = 1000,
+) -> dict:
+    """
+    Comprehensive evaluation with confidence intervals.
+
+    Args:
+        labels: True labels
+        scores: Prediction scores
+        method_name: Name of the method
+        n_bootstrap: Number of bootstrap samples
+
+    Returns:
+        Dictionary with all evaluation metrics and CIs
+    """
+    from sklearn.metrics import roc_curve
+
+    labels = np.array(labels)
+    scores = np.array(scores)
+
+    # Basic evaluation
+    basic_result = evaluate_detector(labels, scores)
+
+    # Bootstrap CI for AUROC
+    auroc_ci = bootstrap_auroc_ci(labels, scores, n_bootstrap)
+
+    # Find optimal predictions
+    fpr, tpr, thresholds = roc_curve(labels, scores)
+    j_scores = tpr - fpr
+    optimal_idx = np.argmax(j_scores)
+    optimal_threshold = thresholds[optimal_idx]
+
+    # Handle inverted scores
+    if basic_result.auroc < 0.5:
+        scores = -scores
+        optimal_threshold = -optimal_threshold
+
+    predictions = (scores >= optimal_threshold).astype(int)
+
+    # Bootstrap CI for accuracy
+    from sklearn.metrics import accuracy_score
+    accuracy_ci = bootstrap_metric_ci(
+        labels, predictions,
+        lambda l, p: accuracy_score(l, p),
+        n_bootstrap,
+    )
+
+    # Statistical tests
+    stat_result = statistical_test(
+        scores[labels == 0].tolist(),
+        scores[labels == 1].tolist(),
+    )
+
+    return {
+        "method": method_name,
+        "auroc": basic_result.auroc,
+        "auroc_ci_lower": auroc_ci["ci_lower"],
+        "auroc_ci_upper": auroc_ci["ci_upper"],
+        "accuracy": basic_result.accuracy,
+        "accuracy_ci_lower": accuracy_ci["ci_lower"],
+        "accuracy_ci_upper": accuracy_ci["ci_upper"],
+        "f1": basic_result.f1,
+        "precision": basic_result.precision,
+        "recall": basic_result.recall,
+        "threshold": basic_result.threshold,
+        "effect_size": stat_result["effect_size"]["cohens_d"],
+        "mann_whitney_p": stat_result["mann_whitney"]["p_value"],
+        "n_samples": len(labels),
+    }
+
+
 def format_results_summary(
     results: dict,
     mask_ratios: list[float] = None,

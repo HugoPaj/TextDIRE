@@ -4,7 +4,15 @@
 # Required: Modal CLI for cloud GPU execution
 modal>=0.60.0
 
+# Environment management
+python-dotenv>=1.0.0
+
+# API clients (for AI text generation)
+openai>=1.0.0
+anthropic>=0.18.0
+
 # Optional: For local testing without GPU
+# Uncomment these for full local development:
 # torch>=2.0
 # transformers>=4.38
 # datasets
@@ -13,3 +21,4 @@ modal>=0.60.0
 # seaborn
 # numpy
 # tqdm
+# scipy
