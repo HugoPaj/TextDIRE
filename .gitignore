@@ -19,3 +19,13 @@ results/
 *.jpg
 *.jpeg
 .claude/
+paper/
+texput.log
+*.zip
+
+# Paper-specific scripts (not useful for general users)
+src/generate_ablation_heatmap.py
+src/generate_all_paper_figures.py
+src/generate_comparison_chart.py
+src/latex_tables.py
+src/paper_figures.py
