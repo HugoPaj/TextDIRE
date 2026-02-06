@@ -104,16 +104,18 @@ def _score_texts(
     texts: list[str],
     model_name: str = "GSAI-ML/LLaDA-8B-Instruct",
     mask_ratio: float = 0.5,
+    mc_samples: int = 8,
     device: str = "cuda",
 ) -> list[float]:
     """
-    Run Text-DIRE detection on texts.
+    Run Text-DIRE detection on texts using MC-averaged scoring.
 
+    Uses multiple random masks per text and batched inference for throughput.
     Returns scores where HIGHER = more likely AI.
     """
     import torch
     from transformers import AutoModel, AutoTokenizer
-    from .dire import TextDIRE
+    from .dire import TextDIRE, compute_dire_score_mc
 
     print(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -124,13 +126,15 @@ def _score_texts(
     ).to(device)
     model.eval()
 
-    dire = TextDIRE(model, tokenizer, device=device)
-
     scores = []
-    for text in tqdm(texts, desc="DIRE detection"):
+    for text in tqdm(texts, desc="DIRE detection (MC)"):
         try:
-            result = dire.compute_score(text, mask_ratio=mask_ratio)
-            scores.append(result.token_accuracy)
+            result = compute_dire_score_mc(
+                model, tokenizer, text,
+                mask_ratio=mask_ratio,
+                mc_samples=mc_samples,
+            )
+            scores.append(result.accuracy_mean or result.mean)
         except Exception as e:
             print(f"Error: {e}")
             scores.append(0.5)

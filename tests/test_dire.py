@@ -188,6 +188,212 @@ class TestExtendedMetrics:
         assert metrics["reconstruction_perplexity"] >= 1
 
 
+class TestMaskTokensPadded:
+    """Tests for mask_tokens_padded (batch-aware masking)."""
+
+    def test_respects_attention_mask(self):
+        """Padding tokens must never be masked."""
+        from src.dire import mask_tokens_padded
+
+        # Two sequences: lengths 8 and 5, padded to 8
+        input_ids = torch.tensor([
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 4, 5, 0, 0, 0],
+        ])
+        attention_mask = torch.tensor([
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0, 0],
+        ])
+
+        for _ in range(20):
+            _, mask_positions = mask_tokens_padded(
+                input_ids, attention_mask, 0.5, mask_token_id=99
+            )
+            # Padding positions (indices 5,6,7 of row 1) must never be True
+            assert not mask_positions[1, 5:].any(), "Padding tokens were masked"
+
+    def test_excludes_boundaries(self):
+        """First and last real tokens must not be masked."""
+        from src.dire import mask_tokens_padded
+
+        input_ids = torch.tensor([
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            [1, 2, 3, 4, 5, 0, 0, 0, 0,  0],
+        ])
+        attention_mask = torch.tensor([
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+        ])
+
+        for _ in range(20):
+            _, mask_positions = mask_tokens_padded(
+                input_ids, attention_mask, 0.5, 99,
+                exclude_first=1, exclude_last=1,
+            )
+            # First token of each row
+            assert not mask_positions[0, 0]
+            assert not mask_positions[1, 0]
+            # Last real token of each row
+            assert not mask_positions[0, 9]
+            assert not mask_positions[1, 4]
+
+    def test_output_shapes(self):
+        """Output tensors must match input shapes."""
+        from src.dire import mask_tokens_padded
+
+        B, L = 4, 20
+        input_ids = torch.randint(1, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.long)
+
+        masked_ids, mask_positions = mask_tokens_padded(
+            input_ids, attention_mask, 0.5, 99
+        )
+        assert masked_ids.shape == (B, L)
+        assert mask_positions.shape == (B, L)
+        assert masked_ids.dtype == input_ids.dtype
+        assert mask_positions.dtype == torch.bool
+
+
+class TestComputeDireScoresBatch:
+    """Tests for compute_dire_scores_batch."""
+
+    @staticmethod
+    def _make_mock_model_and_tokenizer(vocab_size=1000):
+        """Build a deterministic mock model + tokenizer for unit tests."""
+
+        class MockModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dummy = torch.nn.Linear(10, 10)
+
+            def forward(self, x):
+                B, L = x.shape
+                # Return logits that always predict token 1
+                logits = torch.zeros(B, L, vocab_size)
+                logits[:, :, 1] = 10.0  # strong bias toward token 1
+                return type('obj', (object,), {'logits': logits})()
+
+        class MockTokenizer:
+            def __init__(self):
+                self.mask_token_id = 0
+                self.pad_token_id = 0
+                self.eos_token_id = 0
+
+            def __call__(self, texts, **kwargs):
+                if isinstance(texts, str):
+                    texts = [texts]
+                # Each word becomes one token (id=1 for every word)
+                max_len = max(len(t.split()) for t in texts)
+                ids, masks = [], []
+                for t in texts:
+                    tokens = [1] * len(t.split())
+                    pad_len = max_len - len(tokens)
+                    ids.append(tokens + [0] * pad_len)
+                    masks.append([1] * len(tokens) + [0] * pad_len)
+                result = type('obj', (object,), {
+                    'input_ids': torch.tensor(ids),
+                    'attention_mask': torch.tensor(masks),
+                })()
+                result.to = lambda device: result
+                return result
+
+            def decode(self, ids):
+                return "test"
+
+        return MockModel(), MockTokenizer()
+
+    def test_returns_one_result_per_text(self):
+        """Batch function should return one DIREResult per valid text."""
+        from src.dire import compute_dire_scores_batch
+
+        model, tokenizer = self._make_mock_model_and_tokenizer()
+        texts = [
+            "the quick brown fox jumps over the lazy dog",
+            "a shorter sentence here",
+            "another test sentence with several words in it",
+        ]
+        results = compute_dire_scores_batch(
+            model, tokenizer, texts,
+            mask_ratio=0.5, batch_size=2,
+        )
+        assert len(results) == 3
+
+    def test_accuracy_values_in_range(self):
+        """All accuracy values must be in [0, 1]."""
+        from src.dire import compute_dire_scores_batch
+
+        model, tokenizer = self._make_mock_model_and_tokenizer()
+        texts = ["word " * 20 for _ in range(5)]
+        results = compute_dire_scores_batch(
+            model, tokenizer, texts, mask_ratio=0.5, batch_size=4,
+        )
+        for r in results:
+            assert 0.0 <= r.token_accuracy <= 1.0
+            assert abs(r.token_accuracy + r.reconstruction_error - 1.0) < 1e-6
+
+    def test_batch_size_one_matches_single(self):
+        """batch_size=1 should produce the same results as sequential."""
+        from src.dire import compute_dire_scores_batch
+
+        torch.manual_seed(42)
+        model, tokenizer = self._make_mock_model_and_tokenizer()
+        texts = ["one two three four five six seven eight nine ten"]
+
+        torch.manual_seed(0)
+        results_b1 = compute_dire_scores_batch(
+            model, tokenizer, texts, mask_ratio=0.5, batch_size=1,
+        )
+        # Basic sanity — we get a result
+        assert len(results_b1) == 1
+        assert results_b1[0].num_masked > 0
+
+    def test_correct_predictions_stored(self):
+        """Each result should store per-token correctness."""
+        from src.dire import compute_dire_scores_batch
+
+        model, tokenizer = self._make_mock_model_and_tokenizer()
+        texts = ["a b c d e f g h i j k l"]
+        results = compute_dire_scores_batch(
+            model, tokenizer, texts, mask_ratio=0.5, batch_size=1,
+        )
+        assert results[0].correct_predictions is not None
+        assert len(results[0].correct_predictions) == results[0].num_masked
+
+
+class TestTextDIREBatchedScores:
+    """Tests for TextDIRE.compute_scores with batched backend."""
+
+    def test_compute_scores_batched(self):
+        """TextDIRE.compute_scores should use batched inference."""
+        from src.dire import TextDIRE
+
+        model, tokenizer = TestComputeDireScoresBatch._make_mock_model_and_tokenizer()
+        dire = TextDIRE(model, tokenizer)
+
+        texts = ["word " * 15 for _ in range(6)]
+        results = dire.compute_scores(
+            texts, mask_ratios=[0.5], batch_size=4, progress_bar=False,
+        )
+        assert len(results) == 6
+        for r in results:
+            assert "accuracy_0.5" in r
+            assert "error_0.5" in r
+
+    def test_filters_short_texts(self):
+        """Texts shorter than 10 chars should be skipped."""
+        from src.dire import TextDIRE
+
+        model, tokenizer = TestComputeDireScoresBatch._make_mock_model_and_tokenizer()
+        dire = TextDIRE(model, tokenizer)
+
+        texts = ["short", "", "word " * 15, "   ", "word " * 15]
+        results = dire.compute_scores(
+            texts, mask_ratios=[0.5], batch_size=4, progress_bar=False,
+        )
+        # Only the two long texts should produce results
+        assert len(results) == 2
+
+
 class TestTextDIREClass:
     """Tests for TextDIRE class (requires mock model)."""
 

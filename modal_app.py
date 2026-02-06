@@ -3473,13 +3473,24 @@ def run_detectrl_benchmark(
         """
         MC-averaged multi-metric DIRE score. Higher = more AI.
 
-        Runs mc_samples independent random masks and averages:
-        - token accuracy (binary correct/wrong)
-        - mean log-probability of correct tokens (captures confidence)
+        Runs mc_samples independent random masks and pools token-level
+        predictions across all rounds for stable estimates, especially
+        on short texts (e.g., xsum summaries).
 
-        Returns dict with both metrics so evaluate_setting can pick the best.
+        Key improvements over v1:
+        - Excludes BOS/EOS from masking (prevents noisy special-token predictions)
+        - Token-level MC pooling (pools individual token predictions across rounds
+          instead of averaging per-round metrics — critical for short texts)
+        - Adaptive MC: doubles rounds for short texts (<30 tokens)
+        - New features: norm_log_prob (calibrated confidence), token_log_prob_std
+          (reconstruction consistency — AI text has lower variance)
+
+        Returns dict with all metrics so compute_metrics can fuse them.
         """
-        default = {"accuracy": 0.5, "mean_log_prob": -5.0}
+        default = {
+            "accuracy": 0.5, "mean_log_prob": -5.0, "ce_loss": 5.0,
+            "entropy": 5.0, "norm_log_prob": 0.0, "token_log_prob_std": 1.0,
+        }
         if not text or len(str(text).strip()) < 10:
             return default
         try:
@@ -3490,13 +3501,31 @@ def run_detectrl_benchmark(
             if seq_len < 5:
                 return default
 
-            num_mask = max(1, int(seq_len * mask_ratio))
-            all_accuracies = []
-            all_log_probs = []
+            # --- Exclude BOS (first) and EOS (last) from masking ---
+            # Masking special tokens adds noise, especially for short texts.
+            valid_start = 1
+            valid_end = seq_len - 1
+            valid_len = valid_end - valid_start
+            if valid_len < 2:
+                return default
+            num_mask = max(1, int(valid_len * mask_ratio))
 
-            for _ in range(mc_samples):
+            # Adaptive MC: more rounds for short texts to reduce variance
+            effective_mc = mc_samples
+            if seq_len < 30:
+                effective_mc = max(mc_samples, 16)
+
+            # Pool token-level predictions across ALL MC rounds
+            # (instead of averaging per-round metrics which loses signal on short texts)
+            all_token_correct = []
+            all_token_log_probs = []
+            all_token_ce = []
+            all_token_entropy = []
+
+            for _ in range(effective_mc):
                 mask_positions = torch.zeros(seq_len, dtype=torch.bool, device="cuda")
-                positions = torch.randperm(seq_len, device="cuda")[:num_mask]
+                # Sample only from valid range (excludes BOS at 0, EOS at seq_len-1)
+                positions = torch.randperm(valid_len, device="cuda")[:num_mask] + valid_start
                 mask_positions[positions] = True
 
                 masked_ids = input_ids.clone()
@@ -3505,24 +3534,55 @@ def run_detectrl_benchmark(
                 with torch.no_grad():
                     logits = model(masked_ids).logits
 
-                    # Token accuracy
-                    predictions = logits.argmax(dim=-1)
                     original = input_ids[0, mask_positions]
-                    predicted = predictions[0, mask_positions]
-                    acc = (predicted == original).float().mean().item()
-                    all_accuracies.append(acc)
+                    mask_logits = logits[0, mask_positions]
 
-                    # Log-probability of correct tokens
-                    log_probs = F.log_softmax(logits[0, mask_positions], dim=-1)
+                    # Token accuracy (per-token)
+                    predicted = mask_logits.argmax(dim=-1)
+                    correct = (predicted == original).float()
+                    all_token_correct.extend(correct.cpu().tolist())
+
+                    # Log-probability of correct tokens (per-token)
+                    log_probs = F.log_softmax(mask_logits, dim=-1)
                     target_log_probs = log_probs[
                         torch.arange(len(original), device="cuda"), original
                     ]
-                    mlp = target_log_probs.mean().item()
-                    all_log_probs.append(mlp)
+                    all_token_log_probs.extend(target_log_probs.cpu().tolist())
+
+                    # Cross-entropy loss (per-token)
+                    ce = F.cross_entropy(mask_logits, original, reduction='none')
+                    all_token_ce.extend(ce.cpu().tolist())
+
+                    # Entropy of predictions (per-token)
+                    probs = F.softmax(mask_logits, dim=-1)
+                    ent = -(probs * log_probs).sum(dim=-1)
+                    all_token_entropy.extend(ent.cpu().tolist())
+
+            # Compute pooled metrics from all token-level observations
+            token_lp = np.array(all_token_log_probs)
+            token_ent = np.array(all_token_entropy)
+
+            pooled_accuracy = float(np.mean(all_token_correct))
+            pooled_mlp = float(np.mean(token_lp))
+            pooled_ce = float(np.mean(all_token_ce))
+            pooled_entropy = float(np.mean(token_ent))
+
+            # New features for better discrimination:
+            # 1) Normalized log-prob: confidence calibrated by model uncertainty
+            #    AI text → high confidence relative to entropy → more positive value
+            norm_log_prob = float(pooled_mlp / (pooled_entropy + 1e-8))
+
+            # 2) Token log-prob standard deviation: AI text has more uniform
+            #    reconstruction (lower std), human text is spottier (higher std)
+            token_log_prob_std = float(np.std(token_lp))
 
             return {
-                "accuracy": float(np.mean(all_accuracies)),
-                "mean_log_prob": float(np.mean(all_log_probs)),
+                "accuracy": pooled_accuracy,
+                "mean_log_prob": pooled_mlp,
+                "ce_loss": pooled_ce,
+                "entropy": pooled_entropy,
+                "norm_log_prob": norm_log_prob,
+                "token_log_prob_std": token_log_prob_std,
             }
         except Exception:
             return default
@@ -3651,12 +3711,22 @@ def run_detectrl_benchmark(
             "labels": np.array(labels),
             "acc_scores": np.array([s["accuracy"] for s in raw_scores]),
             "mlp_scores": np.array([s["mean_log_prob"] for s in raw_scores]),
+            "ce_scores": np.array([s["ce_loss"] for s in raw_scores]),
+            "ent_scores": np.array([s["entropy"] for s in raw_scores]),
+            "nlp_scores": np.array([s.get("norm_log_prob", 0.0) for s in raw_scores]),
+            "std_scores": np.array([s.get("token_log_prob_std", 1.0) for s in raw_scores]),
             "n": len(labels),
         }
 
     # --- Helper: Compute metrics from pre-computed scores ---
-    def compute_metrics(labels, acc_scores, mlp_scores):
-        """Compute AUROC, F1, TPR@FPR from pre-computed scores. Returns result dict."""
+    def compute_metrics(labels, acc_scores, mlp_scores, ce_scores=None, ent_scores=None,
+                        nlp_scores=None, std_scores=None):
+        """Compute AUROC, F1, TPR@FPR from pre-computed scores with z-norm fusion.
+
+        Enhanced with:
+        - norm_log_prob and token_log_prob_std as individual metric candidates
+        - 6-feature fused score when all metrics are available
+        """
         def eval_metric(scores_arr, metric_name):
             auroc = roc_auc_score(labels, scores_arr)
             if auroc < 0.5:
@@ -3677,11 +3747,60 @@ def run_detectrl_benchmark(
         acc_result = eval_metric(acc_scores.copy(), "accuracy")
         mlp_result = eval_metric(mlp_scores.copy(), "mean_log_prob")
 
-        best = acc_result if acc_result["auroc"] >= mlp_result["auroc"] else mlp_result
+        candidates = [acc_result, mlp_result]
+        metric_log = (f"    accuracy AUROC: {acc_result['auroc']:.4f}  |  "
+                      f"mean_log_prob AUROC: {mlp_result['auroc']:.4f}")
 
-        print(f"    accuracy AUROC: {acc_result['auroc']:.4f}  |  "
-              f"mean_log_prob AUROC: {mlp_result['auroc']:.4f}  |  "
-              f"best: {best['metric']}")
+        # Evaluate new metrics as individual candidates
+        if nlp_scores is not None:
+            nlp_result = eval_metric(nlp_scores.copy(), "norm_log_prob")
+            candidates.append(nlp_result)
+            metric_log += f"  |  norm_lp AUROC: {nlp_result['auroc']:.4f}"
+
+        if std_scores is not None:
+            # Lower std = more AI-like, so negate for scoring (higher = more AI)
+            std_result = eval_metric(-std_scores.copy(), "neg_token_std")
+            candidates.append(std_result)
+            metric_log += f"  |  neg_std AUROC: {std_result['auroc']:.4f}"
+
+        # Z-normalization fusion
+        fused_scores = None
+
+        def z_norm(arr):
+            return (arr - arr.mean()) / (arr.std() + 1e-8)
+
+        if ce_scores is not None and ent_scores is not None:
+            z_acc = z_norm(acc_scores)
+            z_mlp = z_norm(mlp_scores)
+            z_ce_neg = -z_norm(ce_scores)    # lower CE = more AI-like → negate
+            z_ent_neg = -z_norm(ent_scores)  # lower entropy = more AI-like → negate
+
+            # 6-feature fusion when new metrics are available
+            if nlp_scores is not None and std_scores is not None:
+                z_nlp = z_norm(nlp_scores)
+                z_std_neg = -z_norm(std_scores)  # lower std = more AI → negate
+                # Weights: mlp and nlp are the strongest signals; std adds
+                # discrimination for models like Claude whose accuracy overlaps
+                fused = (0.20 * z_acc + 0.25 * z_mlp + 0.15 * z_ce_neg +
+                         0.10 * z_ent_neg + 0.20 * z_nlp + 0.10 * z_std_neg)
+            else:
+                fused = 0.3 * z_acc + 0.4 * z_mlp + 0.2 * z_ce_neg + 0.1 * z_ent_neg
+
+            fused_result = eval_metric(fused.copy(), "fused")
+            candidates.append(fused_result)
+            fused_scores = fused_result["scores"]
+            metric_log += f"  |  fused AUROC: {fused_result['auroc']:.4f}"
+
+        best = max(candidates, key=lambda r: r["auroc"])
+        metric_log += f"  |  best: {best['metric']}"
+        print(metric_log)
+
+        # If fused not available, fall back to best individual metric scores
+        if fused_scores is None:
+            fused_scores = best["scores"]
+            fused_threshold = float(best["threshold"])
+        else:
+            fused_threshold = float(fused_result["threshold"])
 
         return {
             "auroc": float(best["auroc"]),
@@ -3689,7 +3808,9 @@ def run_detectrl_benchmark(
             "tpr_at_1pct": float(best["tpr_at_1pct"]),
             "tpr_at_5pct": float(best["tpr_at_5pct"]),
             "best_scores": best["scores"],
+            "fused_scores": fused_scores,
             "threshold": float(best["threshold"]),
+            "fused_threshold": fused_threshold,
             "best_metric": best["metric"],
             "auroc_accuracy": float(acc_result["auroc"]),
             "auroc_mean_log_prob": float(mlp_result["auroc"]),
@@ -3703,7 +3824,8 @@ def run_detectrl_benchmark(
 
     # --- Helper: Leave-one-out generalization F1 ---
     def leave_one_out_f1(scored_data, setting_names):
-        """Compute leave-one-out generalization F1 across settings."""
+        """Compute leave-one-out generalization F1 across settings.
+        Uses fused_scores for consistent threshold transfer across settings."""
         fold_f1s = []
         for held_out in setting_names:
             if held_out not in scored_data or scored_data[held_out] is None:
@@ -3717,7 +3839,7 @@ def run_detectrl_benchmark(
                 sd = scored_data[name]
                 metrics = scored_data[name]["_metrics"]
                 train_labels.append(sd["labels"])
-                train_scores.append(metrics["best_scores"])
+                train_scores.append(metrics["fused_scores"])
             if not train_labels:
                 continue
             train_labels = np.concatenate(train_labels)
@@ -3732,7 +3854,7 @@ def run_detectrl_benchmark(
             test_sd = scored_data[held_out]
             test_metrics = test_sd["_metrics"]
             fold_f1 = compute_f1_with_threshold(
-                test_sd["labels"], test_metrics["best_scores"], threshold
+                test_sd["labels"], test_metrics["fused_scores"], threshold
             )
             fold_f1s.append(fold_f1)
             print(f"    LOO fold {held_out}: F1={fold_f1:.4f} (threshold={threshold:.4f})")
@@ -3763,7 +3885,7 @@ def run_detectrl_benchmark(
             records = load_detectrl_json(fp)
             sd = score_records(attack_name, records)
             if sd is not None:
-                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"], sd["ce_scores"], sd["ent_scores"], sd.get("nlp_scores"), sd.get("std_scores"))
                 sd["_metrics"] = metrics
                 scored_attacks[attack_name] = sd
                 result = {
@@ -3791,7 +3913,7 @@ def run_detectrl_benchmark(
             records = load_detectrl_json(fp)
             sd = score_records(domain, records)
             if sd is not None:
-                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"], sd["ce_scores"], sd["ent_scores"], sd.get("nlp_scores"), sd.get("std_scores"))
                 sd["_metrics"] = metrics
                 scored_domains[domain] = sd
                 result = {
@@ -3819,7 +3941,7 @@ def run_detectrl_benchmark(
             records = load_detectrl_json(fp)
             sd = score_records(llm, records)
             if sd is not None:
-                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"], sd["ce_scores"], sd["ent_scores"], sd.get("nlp_scores"), sd.get("std_scores"))
                 sd["_metrics"] = metrics
                 scored_llms[llm] = sd
                 result = {
@@ -3908,7 +4030,7 @@ def run_detectrl_benchmark(
             records = load_detectrl_json(fp)
             sd = score_records(f"length_{length}", records)
             if sd is not None:
-                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"], sd["ce_scores"], sd["ent_scores"], sd.get("nlp_scores"), sd.get("std_scores"))
                 sd["_metrics"] = metrics
                 scored_lengths[length] = sd
 
@@ -3921,15 +4043,15 @@ def run_detectrl_benchmark(
                 print('='*50)
                 pivot_sd = scored_lengths[pivot_length]
                 pivot_metrics = pivot_sd["_metrics"]
-                pivot_threshold = pivot_metrics["threshold"]
-                print(f"  Pivot threshold: {pivot_threshold:.4f}")
+                pivot_threshold = pivot_metrics["fused_threshold"]
+                print(f"  Pivot threshold (fused): {pivot_threshold:.4f}")
 
                 test_time_f1s = []
                 for length in sorted(scored_lengths.keys()):
                     sd = scored_lengths[length]
                     m = sd["_metrics"]
                     bucket_f1 = compute_f1_with_threshold(
-                        sd["labels"], m["best_scores"], pivot_threshold
+                        sd["labels"], m["fused_scores"], pivot_threshold
                     )
                     test_time_f1s.append(bucket_f1)
                     print(f"    length={length}: F1={bucket_f1:.4f}")
@@ -3945,9 +4067,9 @@ def run_detectrl_benchmark(
                 for length in sorted(scored_lengths.keys()):
                     sd = scored_lengths[length]
                     m = sd["_metrics"]
-                    bucket_threshold = m["threshold"]
+                    bucket_threshold = m["fused_threshold"]
                     pivot_f1 = compute_f1_with_threshold(
-                        pivot_sd["labels"], pivot_metrics["best_scores"], bucket_threshold
+                        pivot_sd["labels"], pivot_metrics["fused_scores"], bucket_threshold
                     )
                     train_time_f1s.append(pivot_f1)
                     print(f"    length={length}: threshold={bucket_threshold:.4f} → pivot F1={pivot_f1:.4f}")
@@ -3966,6 +4088,8 @@ def run_detectrl_benchmark(
         human_all_labels = []
         human_all_acc = []
         human_all_mlp = []
+        human_all_ce = []
+        human_all_ent = []
 
         # Reuse direct_prompt scores if available
         if "task1_attack" in tasks and "direct_prompt" in scored_attacks:
@@ -3973,6 +4097,8 @@ def run_detectrl_benchmark(
             human_all_labels.append(dp["labels"])
             human_all_acc.append(dp["acc_scores"])
             human_all_mlp.append(dp["mlp_scores"])
+            human_all_ce.append(dp["ce_scores"])
+            human_all_ent.append(dp["ent_scores"])
             print(f"  Reusing direct_prompt scores ({dp['n']} samples)")
         else:
             # Score direct_prompt if not already done
@@ -3984,6 +4110,8 @@ def run_detectrl_benchmark(
                     human_all_labels.append(sd["labels"])
                     human_all_acc.append(sd["acc_scores"])
                     human_all_mlp.append(sd["mlp_scores"])
+                    human_all_ce.append(sd["ce_scores"])
+                    human_all_ent.append(sd["ent_scores"])
 
         for hname, rel_path in DETECTRL_HUMAN_FILES.items():
             fp = download_file(rel_path)
@@ -3996,16 +4124,20 @@ def run_detectrl_benchmark(
                 human_all_labels.append(sd["labels"])
                 human_all_acc.append(sd["acc_scores"])
                 human_all_mlp.append(sd["mlp_scores"])
+                human_all_ce.append(sd["ce_scores"])
+                human_all_ent.append(sd["ent_scores"])
 
         if human_all_labels:
             combined_labels = np.concatenate(human_all_labels)
             combined_acc = np.concatenate(human_all_acc)
             combined_mlp = np.concatenate(human_all_mlp)
+            combined_ce = np.concatenate(human_all_ce)
+            combined_ent = np.concatenate(human_all_ent)
             print(f"  Combined human writing data: {len(combined_labels)} samples "
                   f"(human={int((combined_labels == 0).sum())}, ai={int((combined_labels == 1).sum())})")
 
             if len(set(combined_labels)) >= 2:
-                hw_metrics = compute_metrics(combined_labels, combined_acc, combined_mlp)
+                hw_metrics = compute_metrics(combined_labels, combined_acc, combined_mlp, combined_ce, combined_ent)
                 leaderboard["human_writing_auroc"] = hw_metrics["auroc"]
                 leaderboard["human_writing_f1"] = hw_metrics["f1"]
                 print(f"  Human Writing AUROC: {hw_metrics['auroc']:.4f}  F1: {hw_metrics['f1']:.4f}")
