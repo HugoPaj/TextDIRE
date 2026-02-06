@@ -3397,6 +3397,939 @@ def run_beemo_by_model(
     return results_by_model
 
 
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=14400,
+    volumes={"/vol": volume},
+    memory=32768,
+)
+def run_detectrl_benchmark(
+    tasks: list[str] = None,
+    mask_ratio: float = 0.8,
+    mc_samples: int = 8,
+    max_samples: int = None,
+    full_leaderboard: bool = False,
+):
+    """
+    Run DetectRL benchmark (NeurIPS 2024) evaluation.
+
+    Uses MC-averaged log-probability scoring for better stability:
+    - Multiple random masks per text (mc_samples) to reduce noise
+    - Log-probability of correct tokens (captures confidence, not just accuracy)
+    - Higher mask ratio (0.8) forces harder reconstruction
+
+    Args:
+        tasks: Which tasks to evaluate (default: all)
+        mask_ratio: DIRE mask ratio (default: 0.8 for harder reconstruction)
+        mc_samples: Number of Monte Carlo mask samples per text (default: 8)
+        max_samples: Limit samples per setting (None = use all)
+        full_leaderboard: When True, evaluates all 13 leaderboard metrics
+    """
+    import os
+    import json
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    from datetime import datetime
+    from sklearn.metrics import roc_auc_score, roc_curve, f1_score
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+
+    if tasks is None:
+        tasks = ["task1_attack", "task2_domain_gen", "task3_llm_gen"]
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    detectrl_results_dir = os.path.join(RESULTS_DIR, "detectrl")
+    os.makedirs(detectrl_results_dir, exist_ok=True)
+    detectrl_cache_dir = "/vol/datasets/detectrl"
+    os.makedirs(detectrl_cache_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("=" * 60)
+    print("TEXT-DIRE: DetectRL Benchmark Evaluation")
+    print(f"Tasks: {tasks}")
+    print(f"Mask ratio: {mask_ratio}, MC samples: {mc_samples}")
+    print("Scoring: MC-averaged log-probability (best of accuracy + log_prob)")
+    print("=" * 60)
+
+    # Load LLaDA model
+    MASK_ID = 126336
+    print("\nLoading LLaDA-8B model...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        cache_dir=MODEL_DIR,
+    )
+    model = AutoModel.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        cache_dir=MODEL_DIR,
+    ).to("cuda").eval()
+    print("LLaDA-8B loaded!")
+
+    def compute_dire_score(text):
+        """
+        MC-averaged multi-metric DIRE score. Higher = more AI.
+
+        Runs mc_samples independent random masks and averages:
+        - token accuracy (binary correct/wrong)
+        - mean log-probability of correct tokens (captures confidence)
+
+        Returns dict with both metrics so evaluate_setting can pick the best.
+        """
+        default = {"accuracy": 0.5, "mean_log_prob": -5.0}
+        if not text or len(str(text).strip()) < 10:
+            return default
+        try:
+            input_ids = tokenizer(
+                str(text), return_tensors="pt", truncation=True, max_length=512,
+            )["input_ids"].to("cuda")
+            seq_len = input_ids.shape[1]
+            if seq_len < 5:
+                return default
+
+            num_mask = max(1, int(seq_len * mask_ratio))
+            all_accuracies = []
+            all_log_probs = []
+
+            for _ in range(mc_samples):
+                mask_positions = torch.zeros(seq_len, dtype=torch.bool, device="cuda")
+                positions = torch.randperm(seq_len, device="cuda")[:num_mask]
+                mask_positions[positions] = True
+
+                masked_ids = input_ids.clone()
+                masked_ids[0, mask_positions] = MASK_ID
+
+                with torch.no_grad():
+                    logits = model(masked_ids).logits
+
+                    # Token accuracy
+                    predictions = logits.argmax(dim=-1)
+                    original = input_ids[0, mask_positions]
+                    predicted = predictions[0, mask_positions]
+                    acc = (predicted == original).float().mean().item()
+                    all_accuracies.append(acc)
+
+                    # Log-probability of correct tokens
+                    log_probs = F.log_softmax(logits[0, mask_positions], dim=-1)
+                    target_log_probs = log_probs[
+                        torch.arange(len(original), device="cuda"), original
+                    ]
+                    mlp = target_log_probs.mean().item()
+                    all_log_probs.append(mlp)
+
+            return {
+                "accuracy": float(np.mean(all_accuracies)),
+                "mean_log_prob": float(np.mean(all_log_probs)),
+            }
+        except Exception:
+            return default
+
+    def compute_tpr_at_fpr_local(labels, scores, fpr_targets=None):
+        if fpr_targets is None:
+            fpr_targets = [0.01, 0.05]
+        labels = np.array(labels)
+        scores = np.array(scores)
+        auroc = roc_auc_score(labels, scores)
+        if auroc < 0.5:
+            scores = -scores
+        fpr, tpr, _ = roc_curve(labels, scores)
+        results = {}
+        for target_fpr in fpr_targets:
+            valid_mask = fpr <= target_fpr
+            if valid_mask.any():
+                results[target_fpr] = float(tpr[valid_mask][-1])
+            else:
+                results[target_fpr] = 0.0
+        return results
+
+    # Download DetectRL data
+    print("\nDownloading DetectRL data...")
+    import urllib.request
+    import urllib.error
+
+    DETECTRL_FILES = {
+        "direct_prompt": "Direct_Prompt/direct_prompt_test.json",
+        "prompt_attacks": "Prompt_Attacks/prompt_attacks_llm_test.json",
+        "paraphrase_attacks": "Paraphrase_Attacks/paraphrase_attacks_llm_test.json",
+        "perturbation_attacks": "Perturbation_Attacks/perturbation_attacks_llm_test.json",
+        "data_mixing": "Data_Mixing/data_mixing_attacks_test.json",
+    }
+    DETECTRL_DOMAIN_FILES = {
+        d: f"Multi_Domain/multi_domains_{d}_test.json"
+        for d in ["arxiv", "writing_prompt", "xsum", "yelp_review"]
+    }
+    DETECTRL_MODEL_FILES = {
+        m: f"Multi_LLM/multi_llms_{m}_test.json"
+        for m in ["ChatGPT", "Llama-2-70b", "Claude-instant", "Google-PaLM"]
+    }
+
+    DETECTRL_LENGTH_FILES = {
+        length: f"Varying_Length/cross_length_{length}_test.json"
+        for length in range(20, 361, 20)
+    }
+
+    DETECTRL_HUMAN_FILES = {
+        "paraphrase_human": "Paraphrase_Attacks_Human/paraphrase_attacks_human_test.json",
+        "perturbation_human": "Perturbation_Attacks_Human/perturbation_attacks_human_test.json",
+        "data_mixing_human": "Data_Mixing_Human/data_mixing_attacks_test.json",
+    }
+
+    base_url = "https://raw.githubusercontent.com/NLP2CT/DetectRL/main/Benchmark/Benchmark_Data"
+
+    def download_file(relative_path):
+        local_path = os.path.join(detectrl_cache_dir, relative_path.replace("/", os.sep))
+        if os.path.exists(local_path):
+            return local_path
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        url = f"{base_url}/{relative_path}"
+        try:
+            urllib.request.urlretrieve(url, local_path)
+            return local_path
+        except Exception as e:
+            print(f"  Warning: Failed to download {relative_path}: {e}")
+            return None
+
+    def load_detectrl_json(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        records = []
+        if isinstance(data, list):
+            records = data
+        elif isinstance(data, dict):
+            for key, items in data.items():
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, str):
+                            label = "human" if key.lower() in ("human", "human_text") else "llm"
+                            records.append({"text": item, "label": label, "data_type": key})
+                        elif isinstance(item, dict):
+                            if "label" not in item:
+                                item["label"] = "human" if key.lower() in ("human", "human_text") else "llm"
+                            records.append(item)
+        return records
+
+    # --- Helper: Score records (GPU-expensive, cached for reuse) ---
+    def score_records(name, records):
+        """Score a set of records, return labels + both metric scores."""
+        labels = []
+        valid_texts = []
+        raw_labels = set()
+        for r in records:
+            text = r.get("text", "").strip()
+            if not text:
+                continue
+            label_str = r.get("label", "").lower()
+            raw_labels.add(r.get("label", ""))
+            label = 0 if label_str in ("human", "human_text", "0") else 1
+            labels.append(label)
+            valid_texts.append(text)
+
+        n_human = labels.count(0)
+        n_ai = labels.count(1)
+        print(f"  {name}: {len(valid_texts)} total records (human={n_human}, ai={n_ai}, raw_labels={raw_labels})")
+
+        if max_samples and len(valid_texts) > max_samples:
+            indices = list(range(len(valid_texts)))
+            np.random.seed(42)
+            np.random.shuffle(indices)
+            indices = indices[:max_samples]
+            indices.sort()
+            valid_texts = [valid_texts[i] for i in indices]
+            labels = [labels[i] for i in indices]
+
+        if len(valid_texts) < 10 or len(set(labels)) < 2:
+            print(f"  Skipping {name} - insufficient data ({len(valid_texts)} samples, classes: {set(labels)})")
+            return None
+
+        print(f"  Scoring {len(valid_texts)} samples for {name} (MC={mc_samples})...")
+        raw_scores = [compute_dire_score(t) for t in tqdm(valid_texts, desc=name)]
+
+        return {
+            "labels": np.array(labels),
+            "acc_scores": np.array([s["accuracy"] for s in raw_scores]),
+            "mlp_scores": np.array([s["mean_log_prob"] for s in raw_scores]),
+            "n": len(labels),
+        }
+
+    # --- Helper: Compute metrics from pre-computed scores ---
+    def compute_metrics(labels, acc_scores, mlp_scores):
+        """Compute AUROC, F1, TPR@FPR from pre-computed scores. Returns result dict."""
+        def eval_metric(scores_arr, metric_name):
+            auroc = roc_auc_score(labels, scores_arr)
+            if auroc < 0.5:
+                scores_arr = -scores_arr
+                auroc = 1 - auroc
+            tpr_at_fpr = compute_tpr_at_fpr_local(labels, scores_arr)
+            fpr_curve, tpr_curve, thresholds = roc_curve(labels, scores_arr)
+            j = tpr_curve - fpr_curve
+            thresh = thresholds[np.argmax(j)]
+            preds = (scores_arr >= thresh).astype(int)
+            f1 = f1_score(labels, preds, zero_division=0)
+            return {
+                "auroc": auroc, "tpr_at_1pct": tpr_at_fpr[0.01],
+                "tpr_at_5pct": tpr_at_fpr[0.05], "f1": f1,
+                "scores": scores_arr, "threshold": thresh, "metric": metric_name,
+            }
+
+        acc_result = eval_metric(acc_scores.copy(), "accuracy")
+        mlp_result = eval_metric(mlp_scores.copy(), "mean_log_prob")
+
+        best = acc_result if acc_result["auroc"] >= mlp_result["auroc"] else mlp_result
+
+        print(f"    accuracy AUROC: {acc_result['auroc']:.4f}  |  "
+              f"mean_log_prob AUROC: {mlp_result['auroc']:.4f}  |  "
+              f"best: {best['metric']}")
+
+        return {
+            "auroc": float(best["auroc"]),
+            "f1": float(best["f1"]),
+            "tpr_at_1pct": float(best["tpr_at_1pct"]),
+            "tpr_at_5pct": float(best["tpr_at_5pct"]),
+            "best_scores": best["scores"],
+            "threshold": float(best["threshold"]),
+            "best_metric": best["metric"],
+            "auroc_accuracy": float(acc_result["auroc"]),
+            "auroc_mean_log_prob": float(mlp_result["auroc"]),
+        }
+
+    # --- Helper: F1 with a pre-determined threshold ---
+    def compute_f1_with_threshold(labels, scores, threshold):
+        """Apply a pre-determined threshold and compute F1."""
+        preds = (scores >= threshold).astype(int)
+        return float(f1_score(labels, preds, zero_division=0))
+
+    # --- Helper: Leave-one-out generalization F1 ---
+    def leave_one_out_f1(scored_data, setting_names):
+        """Compute leave-one-out generalization F1 across settings."""
+        fold_f1s = []
+        for held_out in setting_names:
+            if held_out not in scored_data or scored_data[held_out] is None:
+                continue
+            # Pool training data from all other settings
+            train_labels = []
+            train_scores = []
+            for name in setting_names:
+                if name == held_out or name not in scored_data or scored_data[name] is None:
+                    continue
+                sd = scored_data[name]
+                metrics = scored_data[name]["_metrics"]
+                train_labels.append(sd["labels"])
+                train_scores.append(metrics["best_scores"])
+            if not train_labels:
+                continue
+            train_labels = np.concatenate(train_labels)
+            train_scores = np.concatenate(train_scores)
+
+            # Find optimal threshold on training data (Youden's J)
+            fpr_curve, tpr_curve, thresholds = roc_curve(train_labels, train_scores)
+            j = tpr_curve - fpr_curve
+            threshold = thresholds[np.argmax(j)]
+
+            # Apply to held-out data
+            test_sd = scored_data[held_out]
+            test_metrics = test_sd["_metrics"]
+            fold_f1 = compute_f1_with_threshold(
+                test_sd["labels"], test_metrics["best_scores"], threshold
+            )
+            fold_f1s.append(fold_f1)
+            print(f"    LOO fold {held_out}: F1={fold_f1:.4f} (threshold={threshold:.4f})")
+
+        if fold_f1s:
+            avg = float(np.mean(fold_f1s))
+            print(f"    Average generalization F1: {avg:.4f}")
+            return avg
+        return 0.0
+
+    # ===================================================================
+    # Phase 1: Download all data and score
+    # ===================================================================
+    all_results = []
+    scored_attacks = {}
+    scored_domains = {}
+    scored_llms = {}
+
+    # Task 1: Attack robustness
+    if "task1_attack" in tasks:
+        print(f"\n{'='*50}")
+        print("TASK 1: ROBUSTNESS TO ATTACKS (Multi-Attack)")
+        print('='*50)
+        for attack_name, rel_path in DETECTRL_FILES.items():
+            fp = download_file(rel_path)
+            if fp is None:
+                continue
+            records = load_detectrl_json(fp)
+            sd = score_records(attack_name, records)
+            if sd is not None:
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                sd["_metrics"] = metrics
+                scored_attacks[attack_name] = sd
+                result = {
+                    "task": "task1_attack", "setting": attack_name,
+                    "auroc": metrics["auroc"], "f1": metrics["f1"],
+                    "tpr_at_1pct": metrics["tpr_at_1pct"],
+                    "tpr_at_5pct": metrics["tpr_at_5pct"],
+                    "n_samples": sd["n"], "best_metric": metrics["best_metric"],
+                    "auroc_accuracy": metrics["auroc_accuracy"],
+                    "auroc_mean_log_prob": metrics["auroc_mean_log_prob"],
+                }
+                all_results.append(result)
+                print(f"    AUROC: {metrics['auroc']:.4f}  F1: {metrics['f1']:.4f}  "
+                      f"TPR@1%: {metrics['tpr_at_1pct']:.4f}")
+
+    # Task 2: Domain generalization
+    if "task2_domain_gen" in tasks:
+        print(f"\n{'='*50}")
+        print("TASK 2: DOMAIN GENERALIZATION (Multi-Domain)")
+        print('='*50)
+        for domain, rel_path in DETECTRL_DOMAIN_FILES.items():
+            fp = download_file(rel_path)
+            if fp is None:
+                continue
+            records = load_detectrl_json(fp)
+            sd = score_records(domain, records)
+            if sd is not None:
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                sd["_metrics"] = metrics
+                scored_domains[domain] = sd
+                result = {
+                    "task": "task2_domain_gen", "setting": domain,
+                    "auroc": metrics["auroc"], "f1": metrics["f1"],
+                    "tpr_at_1pct": metrics["tpr_at_1pct"],
+                    "tpr_at_5pct": metrics["tpr_at_5pct"],
+                    "n_samples": sd["n"], "best_metric": metrics["best_metric"],
+                    "auroc_accuracy": metrics["auroc_accuracy"],
+                    "auroc_mean_log_prob": metrics["auroc_mean_log_prob"],
+                }
+                all_results.append(result)
+                print(f"    AUROC: {metrics['auroc']:.4f}  F1: {metrics['f1']:.4f}  "
+                      f"TPR@1%: {metrics['tpr_at_1pct']:.4f}")
+
+    # Task 3: LLM generalization
+    if "task3_llm_gen" in tasks:
+        print(f"\n{'='*50}")
+        print("TASK 3: LLM GENERALIZATION (Multi-LLM)")
+        print('='*50)
+        for llm, rel_path in DETECTRL_MODEL_FILES.items():
+            fp = download_file(rel_path)
+            if fp is None:
+                continue
+            records = load_detectrl_json(fp)
+            sd = score_records(llm, records)
+            if sd is not None:
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                sd["_metrics"] = metrics
+                scored_llms[llm] = sd
+                result = {
+                    "task": "task3_llm_gen", "setting": llm,
+                    "auroc": metrics["auroc"], "f1": metrics["f1"],
+                    "tpr_at_1pct": metrics["tpr_at_1pct"],
+                    "tpr_at_5pct": metrics["tpr_at_5pct"],
+                    "n_samples": sd["n"], "best_metric": metrics["best_metric"],
+                    "auroc_accuracy": metrics["auroc_accuracy"],
+                    "auroc_mean_log_prob": metrics["auroc_mean_log_prob"],
+                }
+                all_results.append(result)
+                print(f"    AUROC: {metrics['auroc']:.4f}  F1: {metrics['f1']:.4f}  "
+                      f"TPR@1%: {metrics['tpr_at_1pct']:.4f}")
+
+    # ===================================================================
+    # Phase 2: Generalization F1 (leave-one-out threshold transfer)
+    # Reuses existing scores — zero additional GPU cost
+    # ===================================================================
+    leaderboard = {}
+
+    # Multi-* AUROC + F1 averages
+    if "task2_domain_gen" in tasks and scored_domains:
+        leaderboard["multi_domain_auroc"] = float(np.mean([
+            scored_domains[d]["_metrics"]["auroc"] for d in scored_domains
+        ]))
+        leaderboard["multi_domain_f1"] = float(np.mean([
+            scored_domains[d]["_metrics"]["f1"] for d in scored_domains
+        ]))
+
+    if "task3_llm_gen" in tasks and scored_llms:
+        leaderboard["multi_llm_auroc"] = float(np.mean([
+            scored_llms[m]["_metrics"]["auroc"] for m in scored_llms
+        ]))
+        leaderboard["multi_llm_f1"] = float(np.mean([
+            scored_llms[m]["_metrics"]["f1"] for m in scored_llms
+        ]))
+
+    if "task1_attack" in tasks and scored_attacks:
+        leaderboard["multi_attack_auroc"] = float(np.mean([
+            scored_attacks[a]["_metrics"]["auroc"] for a in scored_attacks
+        ]))
+        leaderboard["multi_attack_f1"] = float(np.mean([
+            scored_attacks[a]["_metrics"]["f1"] for a in scored_attacks
+        ]))
+
+    # Generalization F1 (leave-one-out)
+    if "task2_domain_gen" in tasks and len(scored_domains) >= 2:
+        print(f"\n{'='*50}")
+        print("GENERALIZATION: Domain (leave-one-out)")
+        print('='*50)
+        leaderboard["gen_domain_f1"] = leave_one_out_f1(
+            scored_domains, list(scored_domains.keys())
+        )
+
+    if "task3_llm_gen" in tasks and len(scored_llms) >= 2:
+        print(f"\n{'='*50}")
+        print("GENERALIZATION: LLM (leave-one-out)")
+        print('='*50)
+        leaderboard["gen_llm_f1"] = leave_one_out_f1(
+            scored_llms, list(scored_llms.keys())
+        )
+
+    if "task1_attack" in tasks and len(scored_attacks) >= 2:
+        print(f"\n{'='*50}")
+        print("GENERALIZATION: Attack (leave-one-out)")
+        print('='*50)
+        leaderboard["gen_attack_f1"] = leave_one_out_f1(
+            scored_attacks, list(scored_attacks.keys())
+        )
+
+    # ===================================================================
+    # Phase 3: Full leaderboard — Varying Length + Human Writing
+    # ===================================================================
+    if full_leaderboard:
+        # --- Varying Length ---
+        print(f"\n{'='*50}")
+        print("VARYING LENGTH: Scoring all length buckets")
+        print('='*50)
+        scored_lengths = {}
+        for length, rel_path in DETECTRL_LENGTH_FILES.items():
+            fp = download_file(rel_path)
+            if fp is None:
+                print(f"  Warning: could not download length={length}")
+                continue
+            records = load_detectrl_json(fp)
+            sd = score_records(f"length_{length}", records)
+            if sd is not None:
+                metrics = compute_metrics(sd["labels"], sd["acc_scores"], sd["mlp_scores"])
+                sd["_metrics"] = metrics
+                scored_lengths[length] = sd
+
+        if scored_lengths:
+            # Length Test-Time F1: calibrate on pivot, test on each bucket
+            pivot_length = 200
+            if pivot_length in scored_lengths:
+                print(f"\n{'='*50}")
+                print(f"LENGTH TEST-TIME F1 (pivot={pivot_length})")
+                print('='*50)
+                pivot_sd = scored_lengths[pivot_length]
+                pivot_metrics = pivot_sd["_metrics"]
+                pivot_threshold = pivot_metrics["threshold"]
+                print(f"  Pivot threshold: {pivot_threshold:.4f}")
+
+                test_time_f1s = []
+                for length in sorted(scored_lengths.keys()):
+                    sd = scored_lengths[length]
+                    m = sd["_metrics"]
+                    bucket_f1 = compute_f1_with_threshold(
+                        sd["labels"], m["best_scores"], pivot_threshold
+                    )
+                    test_time_f1s.append(bucket_f1)
+                    print(f"    length={length}: F1={bucket_f1:.4f}")
+
+                leaderboard["len_test_time_f1"] = float(np.mean(test_time_f1s))
+                print(f"  Average Test-Time F1: {leaderboard['len_test_time_f1']:.4f}")
+
+                # Length Train-Time F1: calibrate on each bucket, test on pivot
+                print(f"\n{'='*50}")
+                print(f"LENGTH TRAIN-TIME F1 (pivot={pivot_length})")
+                print('='*50)
+                train_time_f1s = []
+                for length in sorted(scored_lengths.keys()):
+                    sd = scored_lengths[length]
+                    m = sd["_metrics"]
+                    bucket_threshold = m["threshold"]
+                    pivot_f1 = compute_f1_with_threshold(
+                        pivot_sd["labels"], pivot_metrics["best_scores"], bucket_threshold
+                    )
+                    train_time_f1s.append(pivot_f1)
+                    print(f"    length={length}: threshold={bucket_threshold:.4f} → pivot F1={pivot_f1:.4f}")
+
+                leaderboard["len_train_time_f1"] = float(np.mean(train_time_f1s))
+                print(f"  Average Train-Time F1: {leaderboard['len_train_time_f1']:.4f}")
+            else:
+                print(f"  Warning: pivot length {pivot_length} not available, skipping length metrics")
+
+        # --- Human Writing ---
+        print(f"\n{'='*50}")
+        print("HUMAN WRITING: Scoring human-targeted attacks")
+        print('='*50)
+
+        # Combine direct_prompt (already scored in attacks) + 3 human attack files
+        human_all_labels = []
+        human_all_acc = []
+        human_all_mlp = []
+
+        # Reuse direct_prompt scores if available
+        if "task1_attack" in tasks and "direct_prompt" in scored_attacks:
+            dp = scored_attacks["direct_prompt"]
+            human_all_labels.append(dp["labels"])
+            human_all_acc.append(dp["acc_scores"])
+            human_all_mlp.append(dp["mlp_scores"])
+            print(f"  Reusing direct_prompt scores ({dp['n']} samples)")
+        else:
+            # Score direct_prompt if not already done
+            fp = download_file(DETECTRL_FILES["direct_prompt"])
+            if fp:
+                records = load_detectrl_json(fp)
+                sd = score_records("direct_prompt_human", records)
+                if sd is not None:
+                    human_all_labels.append(sd["labels"])
+                    human_all_acc.append(sd["acc_scores"])
+                    human_all_mlp.append(sd["mlp_scores"])
+
+        for hname, rel_path in DETECTRL_HUMAN_FILES.items():
+            fp = download_file(rel_path)
+            if fp is None:
+                print(f"  Warning: could not download {hname}")
+                continue
+            records = load_detectrl_json(fp)
+            sd = score_records(hname, records)
+            if sd is not None:
+                human_all_labels.append(sd["labels"])
+                human_all_acc.append(sd["acc_scores"])
+                human_all_mlp.append(sd["mlp_scores"])
+
+        if human_all_labels:
+            combined_labels = np.concatenate(human_all_labels)
+            combined_acc = np.concatenate(human_all_acc)
+            combined_mlp = np.concatenate(human_all_mlp)
+            print(f"  Combined human writing data: {len(combined_labels)} samples "
+                  f"(human={int((combined_labels == 0).sum())}, ai={int((combined_labels == 1).sum())})")
+
+            if len(set(combined_labels)) >= 2:
+                hw_metrics = compute_metrics(combined_labels, combined_acc, combined_mlp)
+                leaderboard["human_writing_auroc"] = hw_metrics["auroc"]
+                leaderboard["human_writing_f1"] = hw_metrics["f1"]
+                print(f"  Human Writing AUROC: {hw_metrics['auroc']:.4f}  F1: {hw_metrics['f1']:.4f}")
+
+    # ===================================================================
+    # Save results
+    # ===================================================================
+    output_path = os.path.join(detectrl_results_dir, f"detectrl_results_{timestamp}.json")
+    save_data = {
+        "per_setting_results": all_results,
+        "leaderboard": leaderboard,
+        "config": {
+            "mask_ratio": mask_ratio, "mc_samples": mc_samples,
+            "max_samples": max_samples, "full_leaderboard": full_leaderboard,
+        },
+    }
+    with open(output_path, "w") as f:
+        json.dump(save_data, f, indent=2)
+
+    volume.commit()
+
+    # ===================================================================
+    # Print summary — per-setting results
+    # ===================================================================
+    print("\n" + "=" * 90)
+    print("DETECTRL BENCHMARK RESULTS — Per-Setting")
+    print("=" * 90)
+    print(f"{'Task':<20} {'Setting':<22} {'AUROC':<8} {'TPR@1%':<9} {'TPR@5%':<9} {'F1':<8} {'N':<8}")
+    print("-" * 90)
+
+    for r in all_results:
+        print(f"{r['task']:<20} {r['setting']:<22} {r['auroc']:<8.4f} "
+              f"{r['tpr_at_1pct']:<9.4f} {r['tpr_at_5pct']:<9.4f} "
+              f"{r['f1']:<8.4f} {r['n_samples']:<8}")
+
+    if all_results:
+        avg_auroc = np.mean([r["auroc"] for r in all_results])
+        avg_tpr1 = np.mean([r["tpr_at_1pct"] for r in all_results])
+        avg_tpr5 = np.mean([r["tpr_at_5pct"] for r in all_results])
+        print("-" * 90)
+        print(f"{'AVERAGE':<20} {'':>22} {avg_auroc:<8.4f} {avg_tpr1:<9.4f} {avg_tpr5:<9.4f}")
+
+    # ===================================================================
+    # Print leaderboard-format summary (all 13 metrics)
+    # ===================================================================
+    if leaderboard:
+        print("\n" + "=" * 140)
+        print("DETECTRL LEADERBOARD FORMAT")
+        print("=" * 140)
+
+        header_row1 = f"{'':>14} | {'Multi-Domain':>14} | {'Multi-LLM':>14} | {'Multi-Attack':>14}"
+        header_row1 += f" | {'Gen:Dom':>8} | {'Gen:LLM':>8} | {'Gen:Att':>8}"
+        if full_leaderboard:
+            header_row1 += f" | {'Len:Train':>10} | {'Len:Test':>10} | {'Human Writing':>14}"
+        header_row1 += f" | {'AVG':>6}"
+
+        header_row2 = f"{'':>14} | {'AUROC':>6} {'F1':>6} | {'AUROC':>6} {'F1':>6} | {'AUROC':>6} {'F1':>6}"
+        header_row2 += f" | {'F1':>8} | {'F1':>8} | {'F1':>8}"
+        if full_leaderboard:
+            header_row2 += f" | {'F1':>10} | {'F1':>10} | {'AUROC':>6} {'F1':>6}"
+        header_row2 += f" | {'':>6}"
+
+        print(header_row1)
+        print(header_row2)
+        print("-" * 140)
+
+        # Build data row
+        md_auroc = leaderboard.get("multi_domain_auroc", 0)
+        md_f1 = leaderboard.get("multi_domain_f1", 0)
+        ml_auroc = leaderboard.get("multi_llm_auroc", 0)
+        ml_f1 = leaderboard.get("multi_llm_f1", 0)
+        ma_auroc = leaderboard.get("multi_attack_auroc", 0)
+        ma_f1 = leaderboard.get("multi_attack_f1", 0)
+        gd_f1 = leaderboard.get("gen_domain_f1", 0)
+        gl_f1 = leaderboard.get("gen_llm_f1", 0)
+        ga_f1 = leaderboard.get("gen_attack_f1", 0)
+
+        all_metrics = [md_auroc, md_f1, ml_auroc, ml_f1, ma_auroc, ma_f1, gd_f1, gl_f1, ga_f1]
+
+        data_row = f"{'Text-DIRE':>14} | {md_auroc:>6.4f} {md_f1:>6.4f} | {ml_auroc:>6.4f} {ml_f1:>6.4f} | {ma_auroc:>6.4f} {ma_f1:>6.4f}"
+        data_row += f" | {gd_f1:>8.4f} | {gl_f1:>8.4f} | {ga_f1:>8.4f}"
+
+        if full_leaderboard:
+            lt_f1 = leaderboard.get("len_train_time_f1", 0)
+            ltt_f1 = leaderboard.get("len_test_time_f1", 0)
+            hw_auroc = leaderboard.get("human_writing_auroc", 0)
+            hw_f1 = leaderboard.get("human_writing_f1", 0)
+            all_metrics.extend([lt_f1, ltt_f1, hw_auroc, hw_f1])
+            data_row += f" | {lt_f1:>10.4f} | {ltt_f1:>10.4f} | {hw_auroc:>6.4f} {hw_f1:>6.4f}"
+
+        avg = float(np.mean(all_metrics)) if all_metrics else 0
+        data_row += f" | {avg:>6.4f}"
+
+        print(data_row)
+        print("=" * 140)
+
+        leaderboard["avg"] = avg
+        print(f"\nLeaderboard AVG: {avg:.4f}")
+
+    print(f"\nResults saved to: {output_path}")
+
+    return {"per_setting_results": all_results, "leaderboard": leaderboard}
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=7200,
+    volumes={"/vol": volume},
+    memory=32768,
+)
+def run_raid_adversarial(
+    mask_ratio: float = 0.5,
+    max_samples: int = None,
+):
+    """
+    Run RAID benchmark evaluation on adversarial subset only.
+
+    Filters to attacks only (excludes "none"), computes per-attack
+    breakdown with TPR@FPR metrics.
+
+    Args:
+        mask_ratio: DIRE mask ratio
+        max_samples: Limit samples (None = use all)
+    """
+    import os
+    import json
+    import torch
+    import numpy as np
+    from datetime import datetime
+    from sklearn.metrics import roc_auc_score, roc_curve, f1_score
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+    from datasets import load_dataset
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    raid_adv_dir = os.path.join(RESULTS_DIR, "raid_adversarial")
+    os.makedirs(raid_adv_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("=" * 60)
+    print("TEXT-DIRE: RAID Adversarial Subset Evaluation")
+    print(f"Mask ratio: {mask_ratio}")
+    print("=" * 60)
+
+    # Load LLaDA
+    MASK_ID = 126336
+    print("\nLoading LLaDA-8B model...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        cache_dir=MODEL_DIR,
+    )
+    model = AutoModel.from_pretrained(
+        "GSAI-ML/LLaDA-8B-Base",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        cache_dir=MODEL_DIR,
+    ).to("cuda").eval()
+    print("LLaDA-8B loaded!")
+
+    def compute_dire_score(text):
+        if not text or len(str(text).strip()) < 10:
+            return 0.5
+        try:
+            input_ids = tokenizer(
+                str(text), return_tensors="pt", truncation=True, max_length=512,
+            )["input_ids"].to("cuda")
+            seq_len = input_ids.shape[1]
+            if seq_len < 5:
+                return 0.5
+            num_mask = max(1, int(seq_len * mask_ratio))
+            mask_positions = torch.zeros(seq_len, dtype=torch.bool, device="cuda")
+            positions = torch.randperm(seq_len, device="cuda")[:num_mask]
+            mask_positions[positions] = True
+            masked_ids = input_ids.clone()
+            masked_ids[0, mask_positions] = MASK_ID
+            with torch.no_grad():
+                logits = model(masked_ids).logits
+                predictions = logits.argmax(dim=-1)
+                original = input_ids[0, mask_positions]
+                predicted = predictions[0, mask_positions]
+                accuracy = (predicted == original).float().mean().item()
+            return accuracy
+        except Exception:
+            return 0.5
+
+    # Load RAID with adversarial attacks only
+    ADVERSARIAL_ATTACKS = [
+        "paraphrase", "perturb_char", "perturb_word",
+        "homoglyph", "number", "whitespace", "misspelling",
+        "upper_lower", "article_deletion", "alternative_spelling",
+    ]
+
+    print("\nLoading RAID benchmark (adversarial subset)...")
+    try:
+        dataset = load_dataset("liamdugan/raid", split="test")
+    except Exception as e:
+        print(f"Error loading RAID: {e}")
+        return {}
+
+    # Filter to adversarial attacks only
+    texts = []
+    labels = []
+    sources = []
+    for item in dataset:
+        attack = item.get("attack", "none")
+        if attack == "none" or attack not in ADVERSARIAL_ATTACKS:
+            continue
+
+        text = item.get("text", item.get("generation", "")).strip()
+        if not text:
+            continue
+
+        label = 0 if item.get("label") == "human" or item.get("model") == "human" else 1
+
+        texts.append(text)
+        labels.append(label)
+        sources.append(attack)
+
+        if max_samples and len(texts) >= max_samples:
+            break
+
+    print(f"Loaded {len(texts)} adversarial samples (human: {labels.count(0)}, AI: {labels.count(1)})")
+
+    if len(texts) < 20:
+        print("Not enough adversarial data")
+        return {}
+
+    # Compute DIRE scores
+    print("\nComputing DIRE scores...")
+    scores = [compute_dire_score(t) for t in tqdm(texts, desc="DIRE scoring")]
+
+    scores_arr = np.array(scores)
+    labels_arr = np.array(labels)
+    sources_arr = np.array(sources)
+
+    # Overall metrics
+    overall_auroc = roc_auc_score(labels_arr, scores_arr)
+    if overall_auroc < 0.5:
+        scores_arr = -scores_arr
+        overall_auroc = 1 - overall_auroc
+
+    # TPR@FPR
+    fpr_curve, tpr_curve, thresholds_curve = roc_curve(labels_arr, scores_arr)
+    tpr_at_1 = float(tpr_curve[fpr_curve <= 0.01][-1]) if (fpr_curve <= 0.01).any() else 0.0
+    tpr_at_5 = float(tpr_curve[fpr_curve <= 0.05][-1]) if (fpr_curve <= 0.05).any() else 0.0
+
+    # F1
+    j = tpr_curve - fpr_curve
+    thresh = thresholds_curve[np.argmax(j)]
+    preds = (scores_arr >= thresh).astype(int)
+    overall_f1 = float(f1_score(labels_arr, preds, zero_division=0))
+
+    results = {
+        "overall": {
+            "auroc": float(overall_auroc),
+            "tpr_at_1pct": tpr_at_1,
+            "tpr_at_5pct": tpr_at_5,
+            "f1": overall_f1,
+            "n_samples": len(labels_arr),
+        },
+        "per_attack": {},
+    }
+
+    # Per-attack breakdown
+    for attack in ADVERSARIAL_ATTACKS:
+        mask = sources_arr == attack
+        if mask.sum() < 10:
+            continue
+        atk_labels = labels_arr[mask]
+        atk_scores = scores_arr[mask]
+        if len(set(atk_labels)) < 2:
+            continue
+
+        auroc = roc_auc_score(atk_labels, atk_scores)
+        if auroc < 0.5:
+            auroc = 1 - auroc
+
+        fpr_a, tpr_a, _ = roc_curve(atk_labels, atk_scores)
+        t1 = float(tpr_a[fpr_a <= 0.01][-1]) if (fpr_a <= 0.01).any() else 0.0
+        t5 = float(tpr_a[fpr_a <= 0.05][-1]) if (fpr_a <= 0.05).any() else 0.0
+
+        atk_preds = (atk_scores >= thresh).astype(int)
+        atk_f1 = float(f1_score(atk_labels, atk_preds, zero_division=0))
+
+        results["per_attack"][attack] = {
+            "auroc": float(auroc),
+            "tpr_at_1pct": t1,
+            "tpr_at_5pct": t5,
+            "f1": atk_f1,
+            "n_samples": int(mask.sum()),
+        }
+
+    # Save results
+    output_path = os.path.join(raid_adv_dir, f"raid_adversarial_{timestamp}.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    volume.commit()
+
+    # Print summary
+    print("\n" + "=" * 85)
+    print("RAID ADVERSARIAL RESULTS")
+    print("=" * 85)
+    print(f"\nOverall (N={results['overall']['n_samples']}):")
+    print(f"  AUROC:  {results['overall']['auroc']:.4f}")
+    print(f"  TPR@1%: {results['overall']['tpr_at_1pct']:.4f}")
+    print(f"  TPR@5%: {results['overall']['tpr_at_5pct']:.4f}")
+    print(f"  F1:     {results['overall']['f1']:.4f}")
+
+    print(f"\nPer-Attack:")
+    print(f"  {'Attack':<25} {'AUROC':<8} {'TPR@1%':<9} {'TPR@5%':<9} {'F1':<8} {'N':<8}")
+    print(f"  {'-'*67}")
+    for attack, m in sorted(results["per_attack"].items(), key=lambda x: x[1]["auroc"], reverse=True):
+        print(f"  {attack:<25} {m['auroc']:<8.4f} {m['tpr_at_1pct']:<9.4f} "
+              f"{m['tpr_at_5pct']:<9.4f} {m['f1']:<8.4f} {m['n_samples']:<8}")
+
+    print("=" * 85)
+    print(f"\nResults saved to: {output_path}")
+
+    return results
+
+
 @app.local_entrypoint()
 def main(
     num_samples: int = 100,
@@ -3425,10 +4358,13 @@ def main(
         modal run modal_app.py --experiment beemo-diveye --mask-ratio 0.8
         modal run modal_app.py --experiment beemo-enhanced --num-samples 200
         modal run modal_app.py --experiment beemo-zeroshot --num-samples 200
+        modal run modal_app.py --experiment detectrl --num-samples 50
+        modal run modal_app.py --experiment detectrl-full --num-samples 50
+        modal run modal_app.py --experiment raid-adversarial --num-samples 50
 
     Args:
         num_samples: Number of samples per class
-        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye, beemo-enhanced, beemo-zeroshot)
+        experiment: Experiment type (basic, full, modern, mc, beemo, beemo-by-model, beemo-multistep, beemo-logscale, beemo-diveye, beemo-enhanced, beemo-zeroshot, detectrl, detectrl-full, raid-adversarial)
         mc_samples: MC samples for mc experiment
         models: Comma-separated list of models for modern experiment
         openai_key: OpenAI API key (required for modern experiment)
@@ -3612,6 +4548,59 @@ def main(
             print(f"\n  All methods:")
             for method, r in metrics['methods'].items():
                 print(f"    {method}: AUROC={r['auroc']:.4f}")
+
+        return results
+
+    elif experiment in ("detectrl", "detectrl-full"):
+        is_full = experiment == "detectrl-full"
+        effective_mr = mask_ratio if mask_ratio != 0.5 else 0.8  # Default to 0.8 for detectrl
+        print(f"\nRunning DetectRL benchmark (NeurIPS 2024)")
+        print(f"  mode={'full leaderboard (13 metrics)' if is_full else 'standard (9 metrics)'}")
+        print(f"  mask_ratio={effective_mr}, MC samples=8, scoring=best(accuracy, log_prob)")
+        results = run_detectrl_benchmark.remote(
+            tasks=["task1_attack", "task2_domain_gen", "task3_llm_gen"],
+            mask_ratio=effective_mr,
+            mc_samples=8,
+            max_samples=num_samples if num_samples != 100 else None,
+            full_leaderboard=is_full,
+        )
+
+        print("\n" + "=" * 60)
+        print("DETECTRL BENCHMARK COMPLETE")
+        print("=" * 60)
+
+        for r in results.get("per_setting_results", []):
+            best_m = r.get('best_metric', '?')
+            print(f"  {r['task']:<20} {r['setting']:<22} AUROC: {r['auroc']:.4f}  "
+                  f"F1: {r['f1']:.4f}  [{best_m}]")
+
+        lb = results.get("leaderboard", {})
+        if lb:
+            print(f"\n  Leaderboard AVG: {lb.get('avg', 0):.4f}")
+
+        return results
+
+    elif experiment == "raid-adversarial":
+        print(f"\nRunning RAID adversarial subset evaluation (mask_ratio={mask_ratio})...")
+        results = run_raid_adversarial.remote(
+            mask_ratio=mask_ratio,
+            max_samples=num_samples if num_samples != 100 else None,
+        )
+
+        print("\n" + "=" * 60)
+        print("RAID ADVERSARIAL COMPLETE")
+        print("=" * 60)
+
+        if "overall" in results:
+            print(f"\nOverall:")
+            print(f"  AUROC:  {results['overall']['auroc']:.4f}")
+            print(f"  TPR@1%: {results['overall']['tpr_at_1pct']:.4f}")
+            print(f"  TPR@5%: {results['overall']['tpr_at_5pct']:.4f}")
+
+        if "per_attack" in results:
+            print(f"\nPer-Attack:")
+            for attack, m in results["per_attack"].items():
+                print(f"  {attack:<25} AUROC: {m['auroc']:.4f}  TPR@1%: {m['tpr_at_1pct']:.4f}")
 
         return results
 

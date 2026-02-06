@@ -1146,6 +1146,229 @@ def get_available_human_sources() -> list[str]:
     ]
 
 
+# =============================================================================
+# DetectRL Benchmark (NeurIPS 2024)
+# =============================================================================
+
+DETECTRL_DOMAINS = ["arxiv", "writing_prompt", "xsum", "yelp_review"]
+DETECTRL_MODELS = ["ChatGPT", "Llama-2-70b", "Claude-instant", "Google-PaLM"]
+DETECTRL_ATTACKS = ["direct_prompt", "prompt_attacks", "paraphrase_attacks", "perturbation_attacks", "data_mixing"]
+
+# Mapping from task/attack names to GitHub file paths (relative to Benchmark/Benchmark_Data/)
+DETECTRL_FILES = {
+    "direct_prompt": "Direct_Prompt/direct_prompt_test.json",
+    "prompt_attacks": "Prompt_Attacks/prompt_attacks_llm_test.json",
+    "paraphrase_attacks": "Paraphrase_Attacks/paraphrase_attacks_llm_test.json",
+    "perturbation_attacks": "Perturbation_Attacks/perturbation_attacks_llm_test.json",
+    "data_mixing": "Data_Mixing/data_mixing_attacks_test.json",
+}
+
+# Multi-domain files
+DETECTRL_DOMAIN_FILES = {
+    domain: f"Multi_Domain/multi_domains_{domain}_test.json"
+    for domain in DETECTRL_DOMAINS
+}
+
+# Multi-LLM files
+DETECTRL_MODEL_FILES = {
+    model: f"Multi_LLM/multi_llms_{model}_test.json"
+    for model in DETECTRL_MODELS
+}
+
+# Task groupings for evaluation
+DETECTRL_TASKS = {
+    "task1_attack": ["direct_prompt", "prompt_attacks", "paraphrase_attacks",
+                     "perturbation_attacks", "data_mixing"],
+    "task2_domain_gen": list(DETECTRL_DOMAINS),
+    "task3_llm_gen": list(DETECTRL_MODELS),
+}
+
+
+def _download_detectrl_file(relative_path: str, cache_dir: str) -> Optional[str]:
+    """
+    Download a single DetectRL file from GitHub, caching locally.
+
+    Args:
+        relative_path: Path relative to Benchmark_Data/ in the repo
+        cache_dir: Local directory to cache files
+
+    Returns:
+        Path to the downloaded file, or None if download failed
+    """
+    import urllib.request
+    import urllib.error
+
+    local_path = os.path.join(cache_dir, relative_path.replace("/", os.sep))
+
+    # Return cached version if it exists
+    if os.path.exists(local_path):
+        return local_path
+
+    # Download from GitHub
+    base_url = "https://raw.githubusercontent.com/NLP2CT/DetectRL/main/Benchmark/Benchmark_Data"
+    url = f"{base_url}/{relative_path}"
+
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    try:
+        print(f"  Downloading {relative_path}...")
+        urllib.request.urlretrieve(url, local_path)
+        return local_path
+    except urllib.error.URLError as e:
+        print(f"  Warning: Failed to download {relative_path}: {e}")
+        return None
+
+
+def _parse_detectrl_json(file_path: str) -> list[dict]:
+    """Parse a DetectRL JSON file into a list of records."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # DetectRL files may be a list of dicts or a dict of lists
+    if isinstance(data, list):
+        return data
+    elif isinstance(data, dict):
+        # Handle {"human": [...], "llm": [...]} format
+        records = []
+        for key, items in data.items():
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, str):
+                        label = "human" if key.lower() in ("human", "human_text") else "llm"
+                        records.append({"text": item, "label": label, "data_type": key})
+                    elif isinstance(item, dict):
+                        if "label" not in item:
+                            item["label"] = "human" if key.lower() in ("human", "human_text") else "llm"
+                        records.append(item)
+        return records
+
+    return []
+
+
+def load_detectrl_benchmark(
+    split: str = "test",
+    tasks: Optional[list[str]] = None,
+    domains: Optional[list[str]] = None,
+    models: Optional[list[str]] = None,
+    attacks: Optional[list[str]] = None,
+    num_samples: Optional[int] = None,
+    cache_dir: str = "datasets/detectrl",
+) -> TextDataset:
+    """
+    Load the DetectRL benchmark dataset (NeurIPS 2024).
+
+    DetectRL is designed to test detection in real-world scenarios including
+    prompt variation, paraphrase attacks, perturbation attacks, and data mixing.
+
+    Paper: https://arxiv.org/abs/2410.xxxxx
+    GitHub: https://github.com/NLP2CT/DetectRL
+
+    Args:
+        split: Dataset split ("test" only for benchmark)
+        tasks: Filter by task groups (e.g., ["task1_attack", "task2_domain_gen"])
+        domains: Filter by domains (subset of DETECTRL_DOMAINS)
+        models: Filter by LLM types (subset of DETECTRL_MODELS)
+        attacks: Filter by attack types (subset of DETECTRL_ATTACKS)
+        num_samples: Limit number of samples (None for all)
+        cache_dir: Directory to cache downloaded files
+
+    Returns:
+        TextDataset with DetectRL samples
+    """
+    print(f"Loading DetectRL benchmark ({split} split)...")
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Determine which files to download based on filters
+    files_to_load = {}  # source_name -> relative_path
+
+    if tasks:
+        for task in tasks:
+            if task in DETECTRL_TASKS:
+                for setting in DETECTRL_TASKS[task]:
+                    if task == "task1_attack" and setting in DETECTRL_FILES:
+                        files_to_load[f"task1_{setting}"] = DETECTRL_FILES[setting]
+                    elif task == "task2_domain_gen" and setting in DETECTRL_DOMAIN_FILES:
+                        files_to_load[f"task2_{setting}"] = DETECTRL_DOMAIN_FILES[setting]
+                    elif task == "task3_llm_gen" and setting in DETECTRL_MODEL_FILES:
+                        files_to_load[f"task3_{setting}"] = DETECTRL_MODEL_FILES[setting]
+    else:
+        # Load all files by default
+        if attacks:
+            for attack in attacks:
+                if attack in DETECTRL_FILES:
+                    files_to_load[f"task1_{attack}"] = DETECTRL_FILES[attack]
+        else:
+            for name, path in DETECTRL_FILES.items():
+                files_to_load[f"task1_{name}"] = path
+
+        if domains:
+            for domain in domains:
+                if domain in DETECTRL_DOMAIN_FILES:
+                    files_to_load[f"task2_{domain}"] = DETECTRL_DOMAIN_FILES[domain]
+        else:
+            for domain, path in DETECTRL_DOMAIN_FILES.items():
+                files_to_load[f"task2_{domain}"] = path
+
+        if models:
+            for model in models:
+                if model in DETECTRL_MODEL_FILES:
+                    files_to_load[f"task3_{model}"] = DETECTRL_MODEL_FILES[model]
+        else:
+            for model, path in DETECTRL_MODEL_FILES.items():
+                files_to_load[f"task3_{model}"] = path
+
+    texts = []
+    labels = []
+    sources = []
+
+    for source_name, relative_path in files_to_load.items():
+        file_path = _download_detectrl_file(relative_path, cache_dir)
+        if file_path is None:
+            continue
+
+        records = _parse_detectrl_json(file_path)
+
+        for record in records:
+            text = record.get("text", "").strip()
+            if not text:
+                continue
+
+            # Label mapping: "human" -> 0, "llm" -> 1
+            label_str = record.get("label", "").lower()
+            if label_str in ("human", "human_text", "0"):
+                label = 0
+            else:
+                label = 1
+
+            texts.append(text)
+            labels.append(label)
+            sources.append(f"detectrl_{source_name}")
+
+            if num_samples and len(texts) >= num_samples:
+                break
+
+        if num_samples and len(texts) >= num_samples:
+            break
+
+    print(f"Loaded {len(texts)} samples from DetectRL benchmark")
+    print(f"  Human: {labels.count(0)}, AI: {labels.count(1)}")
+
+    return TextDataset(
+        texts=texts,
+        labels=labels,
+        sources=sources,
+        metadata={
+            "benchmark": "DetectRL",
+            "split": split,
+            "tasks": tasks,
+            "domains": domains,
+            "models": models,
+            "attacks": attacks,
+        }
+    )
+
+
 def get_available_benchmarks() -> dict:
     """Get dictionary of available benchmarks."""
     return {
@@ -1153,6 +1376,11 @@ def get_available_benchmarks() -> dict:
             "description": "RAID benchmark (ACL 2024) - 6M+ samples, 11 models, 8 domains, 11 attacks",
             "url": "https://raid-bench.xyz",
             "load_func": "load_raid_benchmark",
+        },
+        "detectrl": {
+            "description": "DetectRL benchmark (NeurIPS 2024) - Real-world scenarios, attacks, domain/LLM transfer",
+            "url": "https://github.com/NLP2CT/DetectRL",
+            "load_func": "load_detectrl_benchmark",
         },
         "mage": {
             "description": "MAGE benchmark - 447.7k samples, 7 domains, 27 generators",
