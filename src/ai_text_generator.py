@@ -14,16 +14,24 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from datetime import datetime
 
-# Load .env file if present
-try:
-    from dotenv import load_dotenv
-    # Look for .env in project root
-    env_path = Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
+
+def load_project_env(env_path: Optional[Path] = None, verbose: bool = False) -> bool:
+    """Load the project .env file when explicitly requested."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return False
+
+    if env_path is None:
+        env_path = Path(__file__).parent.parent / ".env"
+
+    if not env_path.exists():
+        return False
+
+    loaded = load_dotenv(env_path)
+    if verbose and loaded:
         print(f"Loaded environment from {env_path}")
-except ImportError:
-    pass  # dotenv not installed, use system env vars
+    return loaded
 
 
 @dataclass
@@ -159,6 +167,7 @@ class AITextGenerator:
         anthropic_api_key: Optional[str] = None,
         cache_dir: Optional[str] = None,
         rate_limit_delay: float = 0.5,
+        load_env: bool = True,
     ):
         """
         Initialize the AI text generator.
@@ -168,7 +177,11 @@ class AITextGenerator:
             anthropic_api_key: Anthropic API key (uses ANTHROPIC_API_KEY env var if not provided)
             cache_dir: Directory for caching generated texts
             rate_limit_delay: Delay between API calls in seconds
+            load_env: Whether to load the project .env file before reading env vars
         """
+        if load_env:
+            load_project_env()
+
         self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
         self.anthropic_api_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
         self.rate_limit_delay = rate_limit_delay

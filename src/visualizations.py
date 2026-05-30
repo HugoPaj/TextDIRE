@@ -10,8 +10,11 @@ Generates figures suitable for arXiv paper:
 """
 
 import numpy as np
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 # Publication style settings
@@ -55,7 +58,7 @@ def plot_score_distributions(
     save_path: Optional[str] = None,
     figsize: tuple = (8, 5),
     ai_source: str = "AI",
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot score distributions for human and AI texts.
 
@@ -119,7 +122,7 @@ def plot_multi_model_distributions(
     title: str = "DIRE Scores by AI Model",
     save_path: Optional[str] = None,
     figsize: tuple = (12, 8),
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot score distributions for multiple AI sources.
 
@@ -185,7 +188,7 @@ def plot_roc_curves(
     title: str = "ROC Curves",
     save_path: Optional[str] = None,
     figsize: tuple = (8, 8),
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot ROC curves for multiple methods.
 
@@ -259,7 +262,7 @@ def plot_ablation_heatmap(
     cmap: str = "RdYlGn",
     vmin: float = 0.5,
     vmax: float = 1.0,
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot ablation study results as a heatmap.
 
@@ -315,7 +318,7 @@ def plot_token_error_heatmap(
     title: str = "Token-Level Reconstruction",
     save_path: Optional[str] = None,
     figsize: tuple = (14, 3),
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot token-level error visualization for a single text.
 
@@ -331,8 +334,6 @@ def plot_token_error_heatmap(
         matplotlib Figure
     """
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LinearSegmentedColormap
-
     setup_publication_style()
 
     # Limit tokens for visualization
@@ -390,7 +391,7 @@ def plot_tsne_features(
     save_path: Optional[str] = None,
     figsize: tuple = (10, 8),
     perplexity: int = 30,
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot t-SNE visualization of DIRE feature vectors.
 
@@ -431,8 +432,8 @@ def plot_tsne_features(
             )
     else:
         # Color by label
-        human_mask = [l == 0 for l in labels]
-        ai_mask = [l == 1 for l in labels]
+        human_mask = [label == 0 for label in labels]
+        ai_mask = [label == 1 for label in labels]
 
         ax.scatter(
             embeddings[human_mask, 0], embeddings[human_mask, 1],
@@ -463,7 +464,7 @@ def plot_method_comparison_bar(
     title: str = "Method Comparison",
     save_path: Optional[str] = None,
     figsize: tuple = (12, 6),
-) -> 'plt.Figure':
+) -> "Figure":
     """
     Plot bar chart comparing methods across AI sources.
 

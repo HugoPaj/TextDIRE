@@ -25,6 +25,20 @@ class EvaluationResult:
     thresholds: Optional[np.ndarray] = None
 
 
+def _oriented_scores(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    pos_label: int = 1,
+) -> tuple[np.ndarray, float]:
+    """Return scores oriented so higher values indicate the positive class."""
+    from sklearn.metrics import roc_auc_score
+
+    auroc = roc_auc_score(labels, scores)
+    if auroc < 0.5:
+        return -scores, 1 - auroc
+    return scores, auroc
+
+
 def compute_auroc(
     labels: list[int],
     scores: list[float],
@@ -41,14 +55,7 @@ def compute_auroc(
     Returns:
         AUROC score (0.5 = random, 1.0 = perfect)
     """
-    from sklearn.metrics import roc_auc_score
-
-    auroc = roc_auc_score(labels, scores)
-
-    # If AUROC < 0.5, the score direction is inverted
-    if auroc < 0.5:
-        auroc = 1 - auroc
-
+    _, auroc = _oriented_scores(np.array(labels), np.array(scores), pos_label)
     return auroc
 
 
@@ -71,7 +78,6 @@ def evaluate_detector(
         EvaluationResult with all metrics
     """
     from sklearn.metrics import (
-        roc_auc_score,
         roc_curve,
         precision_recall_fscore_support,
         accuracy_score,
@@ -80,15 +86,8 @@ def evaluate_detector(
     labels = np.array(labels)
     scores = np.array(scores)
 
-    # Compute ROC curve
+    scores, auroc = _oriented_scores(labels, scores, pos_label)
     fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=pos_label)
-    auroc = roc_auc_score(labels, scores)
-
-    # Handle inverted scores
-    if auroc < 0.5:
-        fpr, tpr, thresholds = roc_curve(labels, -scores, pos_label=pos_label)
-        auroc = 1 - auroc
-        scores = -scores
 
     # Find optimal threshold (Youden's J statistic)
     if threshold is None:
@@ -786,8 +785,6 @@ def comprehensive_evaluation(
     Returns:
         Dictionary with all evaluation metrics and CIs
     """
-    from sklearn.metrics import roc_curve
-
     labels = np.array(labels)
     scores = np.array(scores)
 
@@ -797,24 +794,14 @@ def comprehensive_evaluation(
     # Bootstrap CI for AUROC
     auroc_ci = bootstrap_auroc_ci(labels, scores, n_bootstrap)
 
-    # Find optimal predictions
-    fpr, tpr, thresholds = roc_curve(labels, scores)
-    j_scores = tpr - fpr
-    optimal_idx = np.argmax(j_scores)
-    optimal_threshold = thresholds[optimal_idx]
-
-    # Handle inverted scores
-    if basic_result.auroc < 0.5:
-        scores = -scores
-        optimal_threshold = -optimal_threshold
-
-    predictions = (scores >= optimal_threshold).astype(int)
+    oriented_scores, _ = _oriented_scores(labels, scores)
+    predictions = (oriented_scores >= basic_result.threshold).astype(int)
 
     # Bootstrap CI for accuracy
     from sklearn.metrics import accuracy_score
     accuracy_ci = bootstrap_metric_ci(
         labels, predictions,
-        lambda l, p: accuracy_score(l, p),
+        lambda label_values, pred_values: accuracy_score(label_values, pred_values),
         n_bootstrap,
     )
 

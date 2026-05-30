@@ -73,6 +73,7 @@ from .diffusion_models import (
 from .ai_text_generator import (
     AITextGenerator,
     get_available_models as get_ai_models,
+    load_project_env,
 )
 
 # Analysis
@@ -138,6 +139,8 @@ __all__ = [
 
     # AI generation
     "AITextGenerator",
+    "get_ai_models",
+    "load_project_env",
 
     # Analysis
     "analyze_reconstruction",
