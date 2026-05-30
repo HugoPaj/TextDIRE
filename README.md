@@ -38,6 +38,71 @@ modal volume get text-dire-vol results/dire_distributions.png .
 modal volume get text-dire-vol results/results_summary.txt .
 ```
 
+## Web App
+
+This repository includes a small FastAPI website for trying Text-DIRE from a
+browser.
+
+```bash
+pip install -r requirements.txt
+uvicorn src.web_app:app --reload
+```
+
+Open http://127.0.0.1:8000.
+
+By default the site runs in `demo` mode so the interface works without a GPU.
+Demo mode is not DIRE; it is a lightweight placeholder signal for local UI
+testing. To use real GPU-backed Text-DIRE scoring through Modal:
+
+```bash
+modal setup
+modal deploy modal_app.py
+uvicorn src.web_app:app --reload
+```
+
+Set `TEXTDIRE_PROVIDER=modal` in `.env` before starting the server. Use
+`TEXTDIRE_PROVIDER=demo` when you only want to try the interface locally.
+The web app looks up the deployed Modal app `text-dire` and function
+`compute_dire_scores_batch`; override these with `TEXTDIRE_MODAL_APP` and
+`TEXTDIRE_MODAL_FUNCTION` if you deploy under different names.
+
+The frontend and API do not need a GPU. The real DIRE inference worker does,
+because LLaDA-8B is too large for practical CPU serving.
+
+## Vercel Deployment
+
+The Vercel deployment serves the static website from `web/` and uses Python
+serverless functions in `api/`. Vercel does not run LLaDA-8B directly; the
+serverless API calls the deployed Modal GPU function.
+
+Deploy the GPU worker first:
+
+```bash
+modal deploy modal_app.py
+```
+
+Then set these Vercel environment variables:
+
+```env
+TEXTDIRE_PROVIDER=modal
+TEXTDIRE_MODAL_APP=text-dire
+TEXTDIRE_MODAL_FUNCTION=compute_dire_scores_batch
+MODAL_TOKEN_ID=...
+MODAL_TOKEN_SECRET=...
+```
+
+For a preview deployment that only exercises the UI, use:
+
+```env
+TEXTDIRE_PROVIDER=demo
+```
+
+The production request path is:
+
+```text
+Browser -> Vercel /api/analyze -> Modal compute_dire_scores_batch -> Vercel -> Browser
+```
+
 ## Project Structure
 
 ```

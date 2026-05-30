@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Text-DIRE Detector</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace" aria-label="Text-DIRE analysis workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Diffusion Reconstruction Error</p>
+            <h1>Text-DIRE Detector</h1>
+          </div>
+          <div class="status-pill" id="providerStatus">Checking provider</div>
+        </header>
+
+        <div class="analysis-grid">
+          <section class="input-panel" aria-label="Input text">
+            <div class="panel-heading">
+              <div>
+                <h2>Sample</h2>
+                <p>Paste at least 20 words for a more stable signal.</p>
+              </div>
+              <button class="icon-button" id="clearButton" type="button" title="Clear text" aria-label="Clear text">
+                <span aria-hidden="true">x</span>
+              </button>
+            </div>
+
+            <textarea
+              id="textInput"
+              spellcheck="true"
+              placeholder="Paste the text you want to inspect..."
+            ></textarea>
+
+            <div class="controls">
+              <label class="segmented">
+                <input type="radio" name="mode" value="fast" />
+                <span>Fast</span>
+              </label>
+              <label class="segmented">
+                <input type="radio" name="mode" value="balanced" checked />
+                <span>Balanced</span>
+              </label>
+              <label class="segmented">
+                <input type="radio" name="mode" value="careful" />
+                <span>Careful</span>
+              </label>
+              <button id="analyzeButton" type="button">Analyze</button>
+            </div>
+
+            <div class="text-stats">
+              <span id="wordCount">0 words</span>
+              <span id="charCount">0 characters</span>
+            </div>
+          </section>
+
+          <section class="result-panel" aria-label="Detection result">
+            <div class="result-header">
+              <div>
+                <h2>Result</h2>
+                <p id="resultSubtitle">Run an analysis to see the DIRE signal.</p>
+              </div>
+              <div class="score-orb" id="scoreOrb">
+                <span id="scoreValue">--</span>
+              </div>
+            </div>
+
+            <div class="prediction" id="prediction">Waiting for text</div>
+
+            <canvas id="signalCanvas" width="720" height="220" aria-label="DIRE score visualization"></canvas>
+
+            <div class="metrics">
+              <div>
+                <span class="metric-label">Confidence</span>
+                <strong id="confidenceValue">--</strong>
+              </div>
+              <div>
+                <span class="metric-label">Threshold</span>
+                <strong id="thresholdValue">--</strong>
+              </div>
+              <div>
+                <span class="metric-label">Runtime</span>
+                <strong id="runtimeValue">--</strong>
+              </div>
+            </div>
+
+            <div class="breakdown" id="breakdown"></div>
+            <div class="notes" id="notes"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

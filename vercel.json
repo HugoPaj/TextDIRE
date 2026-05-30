@@ -1,0 +1,25 @@
+{
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/web/index.html"
+    },
+    {
+      "source": "/static/:path*",
+      "destination": "/web/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/health.py"
+    },
+    {
+      "source": "/api/analyze",
+      "destination": "/api/analyze.py"
+    }
+  ],
+  "functions": {
+    "api/analyze.py": {
+      "maxDuration": 300
+    }
+  }
+}
